@@ -9,7 +9,7 @@ from flask import Flask, request, send_file
 app = Flask(__name__)
 
 # ==========================================================
-# HẰNG SỐ BITBOARD 64-BIT
+# HẰNG SỐ BITBOARD 64-BIT & TỪ ĐIỂN KHỐI CHUẨN BLOCK BLAST
 # ==========================================================
 FULL_MASK = 0xFFFFFFFFFFFFFFFF
 NOT_RIGHT = 0x7F7F7F7F7F7F7F7F
@@ -17,324 +17,258 @@ NOT_LEFT = 0xFEFEFEFEFEFEFEFE
 ROW_MASKS = [0xFF << (r * 8) for r in range(8)]
 COL_MASKS = [0x0101010101010101 << c for c in range(8)]
 
-
-# ==========================================================
-# 1. ĐỊNH VỊ CHÍNH XÁC KHUNG BÀN CỜ 8x8 TRÊN MỌI MÀN HÌNH
-# ==========================================================
-def locate_board_precisely(arr):
-    """
-    Tìm chính xác tọa độ (bx, by, bw) của bàn cờ 8x8 bằng cách:
-    - Tìm viền trái/phải của khung bàn cờ theo độ chênh sáng dọc.
-    - Quét cửa sổ vuông từ 15% -> 42% chiều cao ảnh, chấm điểm dựa trên:
-      1) Độ tương phản viền trên & viền dưới của khung bàn cờ.
-      2) Mức độ tối/đồng nhất của lòng bàn cờ so với vùng nền ngoài.
-      3) Tín hiệu đường kẻ lưới chia 8x8 bên trong.
-    """
-    h, w, _ = arr.shape
-    lum = 0.299 * arr[:, :, 0] + 0.587 * arr[:, :, 1] + 0.114 * arr[:, :, 2]
-
-    # 1. Tìm chiều rộng và vị trí ngang (bx, bw)
-    # Bàn cờ Block Blast luôn nằm chính giữa theo chiều ngang và rộng khoảng 88% - 93% màn hình
-    mid_y0, mid_y1 = int(h * 0.28), int(h * 0.62)
-    gx = np.abs(np.diff(lum[mid_y0:mid_y1, :], axis=1)).mean(axis=0)
-
-    best_bx = int(round(w * 0.046))
-    best_bw = int(round(w * 0.908))
-    best_x_score = -1.0
-
-    for bw_cand in range(int(w * 0.86), int(w * 0.95), 2):
-        bx_cand = (w - bw_cand) // 2
-        right_x = bx_cand + bw_cand - 1
-        if 2 <= bx_cand < w - 3 and 2 <= right_x < w - 3:
-            s_left = gx[bx_cand - 2 : bx_cand + 3].max()
-            s_right = gx[right_x - 2 : right_x + 3].max()
-            if s_left + s_right > best_x_score:
-                best_x_score = s_left + s_right
-                best_bx = bx_cand
-                best_bw = bw_cand
-
-    bx, bw = best_bx, best_bw
-    cw = bw / 8.0
-
-    # 2. Tìm vị trí đỉnh bàn cờ (by)
-    gy = np.abs(np.diff(lum[:, bx : bx + bw], axis=0)).mean(axis=1)
-    row_lum = lum[:, bx : bx + bw].mean(axis=1)
-
-    y_min = int(h * 0.15)
-    y_max = min(int(h * 0.42), h - bw - 40)
-    best_by = int(h * 0.25)
-    best_y_score = -1e9
-
-    for y in range(y_min, y_max, 2):
-        bot_y = y + bw
-        # Cạnh viền trên và viền dưới của khung bàn cờ
-        top_edge = gy[max(0, y - 3) : y + 4].max()
-        bot_edge = gy[max(0, bot_y - 3) : min(len(gy), bot_y + 4)].max()
-
-        # Lòng bàn cờ luôn có nền sẫm hơn vùng tiêu đề điểm số phía trên và vùng khay phía dưới
-        above_lum = row_lum[max(0, y - 22) : max(1, y - 4)].mean()
-        below_lum = row_lum[min(h - 1, bot_y + 5) : min(h, bot_y + 25)].mean()
-        inside_lum = row_lum[y + 6 : bot_y - 6].mean()
-        darkness_drop = ((above_lum - inside_lum) + (below_lum - inside_lum)) * 0.75
-
-        # Tín hiệu 7 đường kẻ ngang chia 8 hàng bên trong bàn cờ
-        grid_lines = 0.0
-        for k in range(1, 8):
-            gy_line = int(round(y + k * cw))
-            grid_lines += gy[max(0, gy_line - 1) : gy_line + 2].max()
-        grid_lines /= 7.0
-
-        total_score = top_edge * 1.4 + bot_edge * 1.6 + darkness_drop + grid_lines * 0.9
-        if total_score > best_y_score:
-            best_y_score = total_score
-            best_by = y
-
-    return bx, best_by, bw
+# Danh sách toàn bộ hình dạng khối hợp lệ trong Block Blast
+BASE_SHAPES = [
+    [[1]],
+    [[1, 1]],
+    [[1, 1, 1]],
+    [[1, 1, 1, 1]],
+    [[1, 1, 1, 1, 1]],
+    [[1, 1], [1, 1]],
+    [[1, 1, 1], [1, 1, 1]],
+    [[1, 1, 1], [1, 1, 1], [1, 1, 1]],
+    [[1, 0], [1, 1]],
+    [[1, 0, 0], [1, 1, 1]],
+    [[0, 0, 1], [1, 1, 1]],
+    [[1, 0, 0], [1, 0, 0], [1, 1, 1]],
+    [[0, 0, 1], [0, 0, 1], [1, 1, 1]],
+    [[0, 1, 0], [1, 1, 1]],
+    [[0, 1, 0], [0, 1, 0], [1, 1, 1]],
+    [[1, 1, 0], [0, 1, 1]],
+    [[0, 1, 1], [1, 1, 0]],
+    [[1, 0], [0, 1]],
+    [[0, 1], [1, 0]],
+    [[1, 0, 0], [0, 1, 0], [0, 0, 1]],
+    [[0, 0, 1], [0, 1, 0], [1, 0, 0]],
+    [[0, 1, 0], [1, 1, 1], [0, 1, 0]],
+]
 
 
-# ==========================================================
-# 2. NHẬN DIỆN 64 Ô TRÊN BÀN CỜ (CHỐNG NHIỄU NỀN HỒNG/TỐI)
-# ==========================================================
-def detect_board_cells(arr, bx, by, bw):
-    cw = bw / 8.0
-    cell_feats = []
+def build_valid_shapes():
+    seen = set()
+    valid = []
+    for s in BASE_SHAPES:
+        cur = np.array(s, dtype=int)
+        for _ in range(4):
+            for m in (cur, np.fliplr(cur)):
+                key = (m.shape[0], m.shape[1], tuple(m.flatten().tolist()))
+                if key not in seen:
+                    seen.add(key)
+                    valid.append(m.tolist())
+            cur = np.rot90(cur)
+    return valid
 
-    for r in range(8):
-        for c in range(8):
-            x0 = int(round(bx + c * cw))
-            y0 = int(round(by + r * cw))
-            x1 = int(round(bx + (c + 1) * cw))
-            y1 = int(round(by + (r + 1) * cw))
 
-            pad = max(2, int((x1 - x0) * 0.14))
-            core = arr[y0 + pad : y1 - pad, x0 + pad : x1 - pad]
-            mean_rgb = core.mean(axis=(0, 1))
-            lum = 0.299 * core[:, :, 0] + 0.587 * core[:, :, 1] + 0.114 * core[:, :, 2]
-            std_lum = float(lum.std())
+VALID_SHAPES = build_valid_shapes()
 
-            # Hiệu ứng vát cạnh 3D (Bevel) của viên gạch: cạnh trên/trái sáng, cạnh dưới/phải tối
-            s = max(2, int(lum.shape[0] * 0.25))
-            top_l = float(lum[:s, :].mean())
-            bot_l = float(lum[-s:, :].mean())
-            left_l = float(lum[:, :s].mean())
-            right_l = float(lum[:, -s:].mean())
-            bevel = abs(top_l - bot_l) + abs(left_l - right_l)
 
-            cell_feats.append({
-                "r": r,
-                "c": c,
-                "rgb": mean_rgb,
-                "std": std_lum,
-                "bevel": bevel,
-                "flatness": std_lum + bevel * 0.95,
-            })
+def snap_to_valid_shape(raw_mat, bw_p, bh_p, unit_base):
+    """Khớp ma trận quét được với hình khối hợp lệ gần nhất trong Block Blast."""
+    raw = np.array(raw_mat, dtype=int)
+    R, C = raw.shape
+    best_shape = raw_mat
+    best_score = -1e9
 
-    # Lấy nhóm ô phẳng nhất (ô trống) để xác định màu nền thực tế của lòng bàn cờ
-    sorted_flat = sorted(cell_feats, key=lambda x: x["flatness"])
-    bg_rgb = np.median(np.array([x["rgb"] for x in sorted_flat[:10]]), axis=0)
-    bg_bevel = float(np.median([x["bevel"] for x in sorted_flat[:10]]))
+    for cand in VALID_SHAPES:
+        c_arr = np.array(cand, dtype=int)
+        cr, cc = c_arr.shape
 
-    board = [[0] * 8 for _ in range(8)]
-    board_mask = 0
+        # Điểm khớp kích thước vật lý
+        u_cand = unit_base * 0.84 if max(cr, cc) == 5 else unit_base
+        exp_w = cc * u_cand
+        exp_h = cr * u_cand
+        size_err = (abs(bw_p - exp_w) + abs(bh_p - exp_h)) / max(1.0, u_cand)
 
-    for f in cell_feats:
-        color_dist = float(np.linalg.norm(f["rgb"] - bg_rgb))
-        bevel_gain = max(0.0, f["bevel"] - bg_bevel)
-        # Viên gạch thật luôn có độ lệch màu so với nền tối VÀ có cạnh vát 3D rõ rệt
-        score = color_dist * 1.1 + bevel_gain * 1.55 + f["std"] * 0.9
-        if score >= 28.0 and (bevel_gain >= 6.5 or color_dist >= 22.0):
-            r, c = f["r"], f["c"]
-            board[r][c] = 1
-            board_mask |= (1 << (r * 8 + c))
+        if size_err > 1.35:
+            continue
 
-    return board, board_mask
+        # Nếu cùng số hàng/cột thì so sánh trực tiếp từng ô
+        if cr == R and cc == C:
+            diff_cells = int(np.abs(raw - c_arr).sum())
+            score = 100.0 - diff_cells * 28.0 - size_err * 18.0
+        else:
+            # Nội suy ma trận raw về kích thước (cr, cc) để so sánh
+            rs = np.linspace(0, R - 1, cr).round().astype(int)
+            cs = np.linspace(0, C - 1, cc).round().astype(int)
+            resampled = raw[np.ix_(rs, cs)]
+            diff_cells = int(np.abs(resampled - c_arr).sum())
+            score = 80.0 - diff_cells * 28.0 - size_err * 22.0
+
+        if score > best_score:
+            best_score = score
+            best_shape = cand
+
+    return best_shape
 
 
 # ==========================================================
-# 3. NHẬN DIỆN CHÍNH XÁC 3 KHỐI CHỜ (STEP-GRID SAMPLING)
+# 1. BỘ NHẬN DIỆN ẢNH CHỤP MÀN HÌNH & TÁCH 3 KHỐI CHUẨN
 # ==========================================================
-def extract_clean_piece_blob(mask):
-    """Tách cụm liên thông của khối gạch ở giữa ô khay, bỏ qua mọi vệt nhiễu chạm mép."""
+def compute_otsu_threshold(values, min_t=22.0, max_t=62.0):
+    arr = np.asarray(values, dtype=np.float32)
+    vmin, vmax = float(arr.min()), float(arr.max())
+    if vmax - vmin < 12.0:
+        return 35.0
+    best_t = (vmin + vmax) / 2.0
+    best_var = -1.0
+    for step in range(1, 32):
+        t = vmin + (vmax - vmin) * (step / 32.0)
+        w0 = arr[arr <= t]
+        w1 = arr[arr > t]
+        if len(w0) == 0 or len(w1) == 0:
+            continue
+        var_between = len(w0) * len(w1) * ((w0.mean() - w1.mean()) ** 2)
+        if var_between > best_var:
+            best_var = var_between
+            best_t = t
+    return float(np.clip(best_t, min_t, max_t))
+
+
+def auto_locate_board(rgb_arr):
+    h, w, _ = rgb_arr.shape
+    lum = (
+        0.299 * rgb_arr[:, :, 0]
+        + 0.587 * rgb_arr[:, :, 1]
+        + 0.114 * rgb_arr[:, :, 2]
+    )
+    board_w = int(round(w * 0.908))
+    board_x = int(round((w - board_w) / 2.0))
+
+    vert_diff = np.abs(np.diff(lum[:, board_x : board_x + board_w], axis=0))
+    row_edge = vert_diff.mean(axis=1)
+
+    y_min = int(h * 0.16)
+    y_max = int(h * 0.30)
+    best_y = int(h * 0.225)
+    best_score = -1.0
+
+    for y in range(y_min, min(y_max, h - board_w - 10)):
+        top_edge = row_edge[max(0, y - 2) : y + 3].max()
+        bot_y = y + board_w
+        bot_edge = row_edge[max(0, bot_y - 2) : min(len(row_edge), bot_y + 3)].max()
+        score = top_edge + bot_edge * 0.85
+        if score > best_score:
+            best_score = score
+            best_y = y
+
+    return board_x, best_y, board_w
+
+
+def extract_main_blob(mask):
+    """Dùng BFS tách đúng cụm pixel của khối gạch, loại bỏ 100% nhiễu viền ngoài."""
     H, W = mask.shape
     visited = np.zeros((H, W), dtype=bool)
     best_blob = None
-    best_score = -1e9
-    cy_mid, cx_mid = H / 2.0, W / 2.0
+    best_weight = -1.0
+    center_y, center_x = H / 2.0, W / 2.0
 
     for r in range(H):
         for c in range(W):
             if mask[r, c] and not visited[r, c]:
                 q = deque([(r, c)])
                 visited[r, c] = True
-                ys = [r]
-                xs = [c]
-                touches_top_or_bot = (r <= 1 or r >= H - 2)
-
+                pts_y = [r]
+                pts_x = [c]
                 while q:
-                    y, x = q.popleft()
-                    if y <= 1 or y >= H - 2:
-                        touches_top_or_bot = True
-                    for ny, nx in ((y - 1, x), (y + 1, x), (y, x - 1), (y, x + 1)):
+                    cy, cx = q.popleft()
+                    for ny, nx in ((cy - 1, cx), (cy + 1, cx), (cy, cx - 1), (cy, cx + 1)):
                         if 0 <= ny < H and 0 <= nx < W and mask[ny, nx] and not visited[ny, nx]:
                             visited[ny, nx] = True
                             q.append((ny, nx))
-                            ys.append(ny)
-                            xs.append(nx)
+                            pts_y.append(ny)
+                            pts_x.append(nx)
 
-                area = len(xs)
-                if area < 14:
+                area = len(pts_x)
+                if area < 10:
                     continue
-
-                # Nếu cụm chạm sát mép trên/dưới (dính viền bàn cờ hoặc banner quảng cáo) -> phạt nặng
-                mean_y = sum(ys) / area
-                mean_x = sum(xs) / area
-                dist = ((mean_y - cy_mid) ** 2 + (mean_x - cx_mid) ** 2) ** 0.5
-                penalty = 500.0 if touches_top_or_bot else 0.0
-                score = area - dist * 2.2 - penalty
-
-                if score > best_score:
-                    best_score = score
-                    best_blob = (np.array(ys), np.array(xs))
+                mean_y = sum(pts_y) / area
+                mean_x = sum(pts_x) / area
+                dist_center = ((mean_y - center_y) ** 2 + (mean_x - center_x) ** 2) ** 0.5
+                # Ưu tiên cụm lớn và nằm gần tâm khay
+                weight = area - dist_center * 1.8
+                if weight > best_weight:
+                    best_weight = weight
+                    best_blob = (pts_y, pts_x)
 
     return best_blob
 
 
-def detect_three_dock_pieces(arr, bx, by, bw):
-    """
-    Định vị vùng khay dưới bàn cờ (tránh hoàn toàn viền đáy bàn cờ và banner quảng cáo dưới cùng),
-    sau đó đo kích thước từng khối theo đơn vị ô chuẩn u để lấy ma trận chính xác.
-    """
-    h, w, _ = arr.shape
-    cw = bw / 8.0
+def detect_single_slot_piece(slot_arr, unit_base):
+    sh, sw, _ = slot_arr.shape
+    # Lấy mẫu màu nền từ 4 góc và viền của ô chứa
+    border_pixels = np.concatenate([
+        slot_arr[0:3, :, :].reshape(-1, 3),
+        slot_arr[-3:, :, :].reshape(-1, 3),
+        slot_arr[:, 0:3, :].reshape(-1, 3),
+        slot_arr[:, -3:, :].reshape(-1, 3),
+    ], axis=0)
+    dock_bg = np.median(border_pixels, axis=0)
 
-    # Khoảng cách từ đáy bàn cờ xuống khay: bắt đầu sau đáy bàn cờ tối thiểu 0.45*cw
-    # và kết thúc trước vùng banner quảng cáo đáy màn hình (h * 0.86)
-    search_y0 = int(round(by + bw + cw * 0.42))
-    search_y1 = min(int(round(h * 0.855)), int(round(by + bw + cw * 3.85)))
+    diff = np.linalg.norm(slot_arr - dock_bg, axis=2)
+    gray = slot_arr.mean(axis=2)
+    gx = np.abs(np.diff(gray, axis=1, prepend=gray[:, :1]))
+    gy = np.abs(np.diff(gray, axis=0, prepend=gray[:1, :]))
+    act = diff * 1.1 + (gx + gy) * 1.45
 
-    if search_y1 - search_y0 < 30:
-        search_y0 = int(round(by + bw + 8))
-        search_y1 = min(h - 10, search_y0 + int(round(cw * 3.0)))
+    # Xóa mép rìa 2px để không bao giờ dính viền ngoài
+    act[:2, :] = 0
+    act[-2:, :] = 0
+    act[:, :2] = 0
+    act[:, -2:] = 0
 
-    dock_band = arr[search_y0:search_y1, bx : bx + bw]
-    # Màu nền chung của vùng khay (hồng nhạt hoặc xanh đậm) lấy từ median toàn dải
-    dock_bg = np.median(dock_band.reshape(-1, 3), axis=0)
+    # Thử ngưỡng thích ứng từ cao xuống thấp để không bỏ sót khối tối màu
+    blob = None
+    chosen_mask = None
+    for thresh in (28.0, 21.0, 15.5):
+        m = act > thresh
+        b = extract_main_blob(m)
+        if b is not None and len(b[0]) >= 16:
+            blob = b
+            chosen_mask = m
+            break
 
-    # Tìm tâm dọc (center_y) nơi có mật độ khối cao nhất để cắt khung khay chuẩn xác
-    band_diff = np.linalg.norm(dock_band - dock_bg, axis=2)
-    row_activity = (band_diff > 20.0).mean(axis=1)
-    active_rows = np.where(row_activity > 0.04)[0]
+    if blob is None:
+        return None
 
-    if len(active_rows) > 4:
-        ry0 = max(0, int(active_rows.min()) - int(cw * 0.35))
-        ry1 = min(dock_band.shape[0], int(active_rows.max()) + int(cw * 0.35))
-    else:
-        ry0 = 0
-        ry1 = dock_band.shape[0]
+    ys, xs = np.array(blob[0]), np.array(blob[1])
+    min_x, max_x = int(xs.min()), int(xs.max())
+    min_y, max_y = int(ys.min()), int(ys.max())
+    bw_p = max_x - min_x + 1
+    bh_p = max_y - min_y + 1
 
-    dock_y0 = search_y0 + ry0
-    dock_y1 = search_y0 + ry1
+    if bw_p < 6 or bh_p < 6:
+        return None
 
-    slot_w = bw / 3.0
-    # Trong Block Blast, 1 ô gạch ở khay chờ có kích thước bằng ~0.465 lần ô bàn cờ
-    # (Riêng thanh 5 ô 1x5 hoặc 5x1 sẽ thu nhỏ nhẹ còn ~0.415 lần ô bàn cờ)
-    unit_std = cw * 0.465
+    max_dim = max(bw_p, bh_p)
+    u = unit_base * 0.84 if max_dim > unit_base * 3.55 else unit_base
+    cols = int(np.clip(round(bw_p / u), 1, 5))
+    rows = int(np.clip(round(bh_p / u), 1, 5))
 
-    pieces = []
-    slot_names = ["TRÁI", "GIỮA", "PHẢI"]
+    # Chỉ dựng mask trên đúng cụm pixel đã lọc
+    clean_mask = np.zeros_like(chosen_mask)
+    clean_mask[ys, xs] = True
 
-    for s in range(3):
-        sx0 = int(round(bx + s * slot_w + 4))
-        sx1 = int(round(bx + (s + 1) * slot_w - 4))
-        slot_arr = arr[dock_y0:dock_y1, sx0:sx1]
-        sh, sw, _ = slot_arr.shape
-        if sh < 10 or sw < 10:
-            continue
+    mat = np.zeros((rows, cols), dtype=int)
+    sub_w = bw_p / float(cols)
+    sub_h = bh_p / float(rows)
 
-        # Lấy màu nền cục bộ từ mép trái/phải của slot
-        edge_px = np.concatenate([
-            slot_arr[:, :3, :].reshape(-1, 3),
-            slot_arr[:, -3:, :].reshape(-1, 3),
-        ], axis=0)
-        local_bg = np.median(edge_px, axis=0)
+    for r in range(rows):
+        for c in range(cols):
+            cx0 = int(min_x + c * sub_w + sub_w * 0.14)
+            cx1 = int(min_x + (c + 1) * sub_w - sub_w * 0.14)
+            cy0 = int(min_y + r * sub_h + sub_h * 0.14)
+            cy1 = int(min_y + (r + 1) * sub_h - sub_h * 0.14)
+            sub_m = clean_mask[max(0, cy0):min(sh, cy1 + 1), max(0, cx0):min(sw, cx1 + 1)]
+            if sub_m.size > 0 and sub_m.mean() > 0.28:
+                mat[r, c] = 1
 
-        color_dist = np.linalg.norm(slot_arr - local_bg, axis=2)
-        gray = slot_arr.mean(axis=2)
-        gx = np.abs(np.diff(gray, axis=1, prepend=gray[:, :1]))
-        gy = np.abs(np.diff(gray, axis=0, prepend=gray[:1, :]))
+    valid_r = np.any(mat == 1, axis=1)
+    valid_c = np.any(mat == 1, axis=0)
+    if not (np.any(valid_r) and np.any(valid_c)):
+        return [[1]]
 
-        # Kết hợp độ lệch màu và cạnh vát 3D của viên gạch
-        act = color_dist * 1.15 + (gx + gy) * 1.35
-        act[:2, :] = 0
-        act[-2:, :] = 0
-        act[:, :2] = 0
-        act[:, -2:] = 0
-
-        blob = None
-        for thresh in (25.0, 19.0, 14.5):
-            m = act > thresh
-            b = extract_clean_piece_blob(m)
-            if b is not None and len(b[0]) >= 16:
-                blob = b
-                break
-
-        if blob is None:
-            continue
-
-        ys, xs = blob
-        min_x, max_x = int(np.percentile(xs, 1)), int(np.percentile(xs, 99))
-        min_y, max_y = int(np.percentile(ys, 1)), int(np.percentile(ys, 99))
-        bw_p = max_x - min_x + 1
-        bh_p = max_y - min_y + 1
-
-        if bw_p < 6 or bh_p < 6:
-            continue
-
-        # Xác định số hàng (rows) và số cột (cols) của khối dựa trên kích thước chuẩn
-        ratio_max = max(bw_p, bh_p) / unit_std
-        if ratio_max >= 3.65:
-            # Khối có chiều dài 4 hoặc 5 ô (thu nhỏ nhẹ trong khay)
-            u_eff = unit_std * 0.85
-        else:
-            u_eff = unit_std
-
-        cols = int(np.clip(round(bw_p / u_eff), 1, 5))
-        rows = int(np.clip(round(bh_p / u_eff), 1, 5))
-
-        # Tạo mask sạch của riêng cụm gạch
-        clean_mask = np.zeros((sh, sw), dtype=bool)
-        clean_mask[ys, xs] = True
-
-        mat = np.zeros((rows, cols), dtype=int)
-        sub_w = bw_p / float(cols)
-        sub_h = bh_p / float(rows)
-
-        for r in range(rows):
-            for c in range(cols):
-                # Lấy vùng lõi 65% giữa mỗi ô con để kiểm tra có gạch hay khuyết
-                cx0 = int(round(min_x + (c + 0.18) * sub_w))
-                cx1 = int(round(min_x + (c + 0.82) * sub_w))
-                cy0 = int(round(min_y + (r + 0.18) * sub_h))
-                cy1 = int(round(min_y + (r + 0.82) * sub_h))
-
-                sub_m = clean_mask[max(0, cy0) : min(sh, cy1 + 1), max(0, cx0) : min(sw, cx1 + 1)]
-                sub_act = act[max(0, cy0) : min(sh, cy1 + 1), max(0, cx0) : min(sw, cx1 + 1)]
-
-                if sub_m.size > 0 and (sub_m.mean() >= 0.32 or sub_act.mean() >= 22.0):
-                    mat[r, c] = 1
-
-        valid_r = np.any(mat == 1, axis=1)
-        valid_c = np.any(mat == 1, axis=0)
-        if np.any(valid_r) and np.any(valid_c):
-            mat_list = mat[valid_r][:, valid_c].tolist()
-            pieces.append({
-                "slot": s + 1,
-                "name": slot_names[s],
-                "matrix": mat_list,
-                "placements": precompute_placements(mat_list),
-            })
-
-    return pieces
+    mat = mat[valid_r][:, valid_c].tolist()
+    return snap_to_valid_shape(mat, bw_p, bh_p, unit_base)
 
 
 def detect_board_and_pieces(pil_img):
@@ -344,16 +278,87 @@ def detect_board_and_pieces(pil_img):
     img = pil_img.resize((target_w, target_h), Image.Resampling.BILINEAR)
     arr = np.asarray(img, dtype=np.float32)
 
-    bx, by, bw = locate_board_precisely(arr)
-    board, board_mask = detect_board_cells(arr, bx, by, bw)
-    pieces = detect_three_dock_pieces(arr, bx, by, bw)
+    bx, by, bw = auto_locate_board(arr)
+    cw = bw / 8.0
 
-    meta = {"bx": bx, "by": by, "bw": bw, "cw": bw / 8.0, "scaled_img": img}
+    cell_feats = []
+    for r in range(8):
+        for c in range(8):
+            x0 = int(bx + c * cw)
+            y0 = int(by + r * cw)
+            x1 = int(bx + (c + 1) * cw)
+            y1 = int(by + (r + 1) * cw)
+
+            pad = max(2, int((x1 - x0) * 0.15))
+            core = arr[y0 + pad : y1 - pad, x0 + pad : x1 - pad]
+            mean_rgb = core.mean(axis=(0, 1))
+            lum = 0.299 * core[:, :, 0] + 0.587 * core[:, :, 1] + 0.114 * core[:, :, 2]
+            std_lum = float(lum.std())
+
+            b_strip = max(2, int(lum.shape[0] * 0.24))
+            top_l = lum[:b_strip, :].mean()
+            bot_l = lum[-b_strip:, :].mean()
+            left_l = lum[:, :b_strip].mean()
+            right_l = lum[:, -b_strip:].mean()
+            bevel = abs(top_l - bot_l) + abs(left_l - right_l)
+
+            cell_feats.append({
+                "r": r,
+                "c": c,
+                "rgb": mean_rgb,
+                "std": std_lum,
+                "bevel": float(bevel),
+                "flatness": std_lum + float(bevel) * 0.9,
+            })
+
+    sorted_flat = sorted(cell_feats, key=lambda x: x["flatness"])
+    bg_rgb = np.median(np.array([x["rgb"] for x in sorted_flat[:10]]), axis=0)
+
+    scores = []
+    for f in cell_feats:
+        dist = float(np.linalg.norm(f["rgb"] - bg_rgb))
+        score = dist * 1.15 + f["bevel"] * 1.35 + f["std"] * 0.95
+        f["score"] = score
+        scores.append(score)
+
+    thresh = compute_otsu_threshold(scores)
+    board = [[0] * 8 for _ in range(8)]
+    board_mask = 0
+    for f in cell_feats:
+        if f["score"] >= thresh:
+            r, c = f["r"], f["c"]
+            board[r][c] = 1
+            board_mask |= (1 << (r * 8 + c))
+
+    # Vùng khay 3 khối: giới hạn chặt không chạm vào thanh Home Bar dưới đáy iPhone
+    dock_y0 = int(by + bw + cw * 0.55)
+    dock_y1 = min(int(target_h * 0.88), int(dock_y0 + cw * 3.15))
+    dock_x0 = int(target_w * 0.045)
+    slot_w = int((target_w * 0.91) / 3.0)
+    unit_base = cw * 0.468
+
+    pieces = []
+    slot_names = ["TRÁI", "GIỮA", "PHẢI"]
+
+    for s in range(3):
+        sx0 = dock_x0 + s * slot_w + 4
+        sx1 = dock_x0 + (s + 1) * slot_w - 4
+        slot_arr = arr[dock_y0:dock_y1, sx0:sx1]
+        mat = detect_single_slot_piece(slot_arr, unit_base)
+        if mat is not None:
+            pieces.append({
+                "slot": s + 1,
+                "name": slot_names[s],
+                "matrix": mat,
+                "placements": precompute_placements(mat),
+            })
+
+    meta = {"bx": bx, "by": by, "bw": bw, "cw": cw, "scaled_img": img}
     return board, board_mask, pieces, meta
 
 
 # ==========================================================
-# 4. BỘ GIẢI BITBOARD 64-BIT SIÊU TỐC (< 0.03 GIÂY)
+# 2. BỘ GIẢI BITBOARD 64-BIT SIÊU TỐC (< 0.03 GIÂY)
 # ==========================================================
 def precompute_placements(mat):
     R, C = len(mat), len(mat[0])
@@ -462,6 +467,7 @@ def solve_best_sequence(board_mask, pieces):
                 steps.pop()
             else:
                 candidates.sort(key=lambda x: x[0], reverse=True)
+                # Mở rộng nhánh lên 12 để không bao giờ bỏ sót phương án đặt được khối thứ 3
                 for _, r0, c0, nb, lines, pts in candidates[:12]:
                     steps.append({
                         "slot": p["slot"],
@@ -480,13 +486,8 @@ def solve_best_sequence(board_mask, pieces):
 
 
 # ==========================================================
-# 5. ĐỊNH DẠNG KẾT QUẢ GỌN RÕ CHO iOS SHORTCUTS
+# 3. ĐỊNH DẠNG THÔNG BÁO ĐỦ 3 BƯỚC RÕ RÀNG TRÊN ĐẦU
 # ==========================================================
-def shape_tag(mat):
-    """Mô tả ngắn kích thước khối (VD: 3x2, 2x3, 1x5) để kiểm chứng nhanh."""
-    return f"{len(mat)}×{len(mat[0])}"
-
-
 def format_ios_alert_text(board, pieces, steps):
     if not steps:
         return "⚠️ Không tìm thấy nước đi hợp lệ!"
@@ -500,9 +501,8 @@ def format_ios_alert_text(board, pieces, steps):
         placed_slots.add(st["slot"])
         badge = step_badges[i] if i < 3 else "🔸"
         clear_note = f" (💥Xóa {st['lines']})" if st["lines"] > 0 else ""
-        dim_str = shape_tag(st["matrix"])
         lines_text.append(
-            f"{badge} {st['name']} ({dim_str}) ➔ H{st['row']}, C{st['col']}{clear_note}"
+            f"{badge} {st['name']} ➔ H{st['row']}, C{st['col']}{clear_note}"
         )
 
         mat = st["matrix"]
@@ -510,14 +510,16 @@ def format_ios_alert_text(board, pieces, steps):
         for dr in range(len(mat)):
             for dc in range(len(mat[0])):
                 if mat[dr][dc] == 1:
+                    # Nếu ô đã có số bước trước (do xóa hàng rồi đặt đè), giữ số bước trước để không biến dạng hình
                     if grid[r0 + dr][c0 + dc] not in ("1️⃣", "2️⃣", "3️⃣"):
                         grid[r0 + dr][c0 + dc] = badge
 
+    # Nếu có khối trong khay chưa đặt được, vẫn hiển thị dòng thứ 3 để người chơi biết rõ
     for p in pieces:
         if p["slot"] not in placed_slots:
             idx = len(lines_text)
             badge = step_badges[idx] if idx < 3 else "🔸"
-            lines_text.append(f"{badge} {p['name']} ({shape_tag(p['matrix'])}) ➔ Hết chỗ!")
+            lines_text.append(f"{badge} {p['name']} ➔ Hết chỗ đặt!")
 
     map_str = "\n".join("".join(row) for row in grid)
     return "\n".join(lines_text) + "\n" + map_str
@@ -566,7 +568,7 @@ def extract_image_from_request(req):
 
 @app.route("/", methods=["GET"])
 def health_check():
-    return "OK - Block Blast Solver v3.0", 200
+    return "OK", 200
 
 
 @app.route("/solve", methods=["POST"])
