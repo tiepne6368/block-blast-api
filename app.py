@@ -151,205 +151,187 @@ def detect_board_cells(arr, bx, by, bw):
 
 
 # ==========================================================
-# 3. NHẬN DIỆN CHÍNH XÁC 3 KHỐI CHỜ (CANONICAL TEMPLATE MATCHING)
+# 3. NHẬN DIỆN CHÍNH XÁC 3 KHỐI CHỜ (STEP-GRID SAMPLING)
 # ==========================================================
-# Danh mục toàn bộ các hình dạng hợp lệ duy nhất trong game Block Blast
-# Không có bất kỳ khối 2x5, 3x5, 4x2 nào tồn tại trong game!
-CANONICAL_SHAPES = [
-    # 1 ô
-    ([[1]], "1x1"),
-    # 2 ô
-    ([[1, 1]], "1x2"),
-    ([[1], [1]], "2x1"),
-    # 3 ô thẳng & góc
-    ([[1, 1, 1]], "1x3"),
-    ([[1], [1], [1]], "3x1"),
-    ([[1, 0], [1, 1]], "L3-TL"),
-    ([[0, 1], [1, 1]], "L3-TR"),
-    ([[1, 1], [1, 0]], "L3-BL"),
-    ([[1, 1], [0, 1]], "L3-BR"),
-    # 4 ô vuông
-    ([[1, 1], [1, 1]], "2x2"),
-    # 4 ô thẳng
-    ([[1, 1, 1, 1]], "1x4"),
-    ([[1], [1], [1], [1]], "4x1"),
-    # 4 ô L/J (3x2 và 2x3)
-    ([[1, 0], [1, 0], [1, 1]], "L-3x2-1"),
-    ([[0, 1], [0, 1], [1, 1]], "L-3x2-2"),
-    ([[1, 1], [1, 0], [1, 0]], "L-3x2-3"),
-    ([[1, 1], [0, 1], [0, 1]], "L-3x2-4"),
-    ([[1, 0, 0], [1, 1, 1]], "L-2x3-1"),
-    ([[0, 0, 1], [1, 1, 1]], "L-2x3-2"),
-    ([[1, 1, 1], [1, 0, 0]], "L-2x3-3"),
-    ([[1, 1, 1], [0, 0, 1]], "L-2x3-4"),
-    # 4 ô T (3x2 và 2x3)
-    ([[1, 1, 1], [0, 1, 0]], "T-2x3-U"),
-    ([[0, 1, 0], [1, 1, 1]], "T-2x3-D"),
-    ([[1, 0], [1, 1], [1, 0]], "T-3x2-L"),
-    ([[0, 1], [1, 1], [0, 1]], "T-3x2-R"),
-    # 4 ô Z/S (3x2 và 2x3)
-    ([[1, 1, 0], [0, 1, 1]], "Z-2x3-1"),
-    ([[0, 1, 1], [1, 1, 0]], "Z-2x3-2"),
-    ([[1, 0], [1, 1], [0, 1]], "Z-3x2-1"),
-    ([[0, 1], [1, 1], [1, 0]], "Z-3x2-2"),
-    # 5 ô thẳng
-    ([[1, 1, 1, 1, 1]], "1x5"),
-    ([[1], [1], [1], [1], [1]], "5x1"),
-    # 6 ô chữ nhật đặc
-    ([[1, 1, 1], [1, 1, 1]], "2x3-Đặc"),
-    ([[1, 1], [1, 1], [1, 1]], "3x2-Đặc"),
-    # 3x3 hình chữ L lớn (5 ô)
-    ([[1, 0, 0], [1, 0, 0], [1, 1, 1]], "BigL-3x3-1"),
-    ([[0, 0, 1], [0, 0, 1], [1, 1, 1]], "BigL-3x3-2"),
-    ([[1, 1, 1], [1, 0, 0], [1, 0, 0]], "BigL-3x3-3"),
-    ([[1, 1, 1], [0, 0, 1], [0, 0, 1]], "BigL-3x3-4"),
-    # 3x3 dấu cộng (5 ô)
-    ([[0, 1, 0], [1, 1, 1], [0, 1, 0]], "Plus-3x3"),
-    # 3x3 đặc (9 ô)
-    ([[1, 1, 1], [1, 1, 1], [1, 1, 1]], "3x3-Đặc"),
-]
-
-
-def match_best_canonical_shape(slot_arr, cw):
-    """
-    So khớp khay chứa với danh mục khối chuẩn Block Blast:
-    1. Lấy màu nền an toàn từ mép trên đỉnh slot (nơi khối không bao giờ chạm tới).
-    2. Tách lớp bóng đổ đen dưới chân khối dựa trên độ bão hòa màu và độ sáng.
-    3. Thử nghiệm trên các khối chuẩn: tính điểm tương quan giữa lõi ô và hình mẫu.
-    """
-    sh, sw, _ = slot_arr.shape
-    if sh < 20 or sw < 20:
-        return None
-
-    # 1. Lấy màu nền an toàn từ 15% phía trên đỉnh slot (không dính cạnh gạch)
-    top_band = slot_arr[: max(4, int(sh * 0.16)), :]
-    local_bg = np.median(top_band.reshape(-1, 3), axis=0)
-
-    # 2. Phân đoạn tiền cảnh: khối gạch vs nền và bóng đổ
-    # Block Blast luôn có bóng đổ màu tối sẫm (đen mờ) dưới chân và bên phải gạch
-    diff = np.linalg.norm(slot_arr - local_bg, axis=2)
-    lum = 0.299 * slot_arr[:, :, 0] + 0.587 * slot_arr[:, :, 1] + 0.114 * slot_arr[:, :, 2]
-    bg_lum = float(0.299 * local_bg[0] + 0.587 * local_bg[1] + 0.114 * local_bg[2])
-
-    # Gạch thật: chênh màu rõ rệt (> 24) VÀ không phải là bóng đổ tối (lum >= bg_lum * 0.82)
-    # Hoặc nếu nền tối (navy): gạch sáng hơn hẳn nền (lum > bg_lum + 25)
-    if bg_lum < 80:
-        # Nền tối (classic navy theme)
-        piece_mask = (diff > 25.0) & (lum > bg_lum + 18.0)
-    else:
-        # Nền sáng/hồng/vàng: bóng đổ đen bị loại bỏ bằng ngưỡng độ sáng
-        piece_mask = (diff > 24.0) & (lum >= bg_lum * 0.78)
-
-    # 3. Tìm vùng bao quanh liên thông chính
-    ys, xs = np.where(piece_mask)
-    if len(xs) < 25:
-        return None
-
-    # Lọc ngoại lai 2% và 98% để loại bóng mờ và tia nhiễu
-    min_x = int(np.percentile(xs, 2))
-    max_x = int(np.percentile(xs, 98))
-    min_y = int(np.percentile(ys, 2))
-    max_y = int(np.percentile(ys, 98))
-
-    blob_w = max_x - min_x + 1
-    blob_h = max_y - min_y + 1
-
-    if blob_w < 8 or blob_h < 8:
-        return None
-
+def extract_clean_piece_blob(mask):
+    """Tách cụm liên thông của khối gạch ở giữa ô khay, bỏ qua mọi vệt nhiễu chạm mép."""
+    H, W = mask.shape
+    visited = np.zeros((H, W), dtype=bool)
+    best_blob = None
     best_score = -1e9
-    best_matrix = None
+    cy_mid, cx_mid = H / 2.0, W / 2.0
 
-    # 4. Duyệt qua tất cả các hình dạng chuẩn duy nhất trong Block Blast
-    for template, _ in CANONICAL_SHAPES:
-        rows = len(template)
-        cols = len(template[0])
+    for r in range(H):
+        for c in range(W):
+            if mask[r, c] and not visited[r, c]:
+                q = deque([(r, c)])
+                visited[r, c] = True
+                ys = [r]
+                xs = [c]
+                touches_top_or_bot = (r <= 1 or r >= H - 2)
 
-        # Kích thước ô đơn vị ước tính theo mẫu này
-        u_w = blob_w / float(cols)
-        u_h = blob_h / float(rows)
-        u_avg = (u_w + u_h) / 2.0
+                while q:
+                    y, x = q.popleft()
+                    if y <= 1 or y >= H - 2:
+                        touches_top_or_bot = True
+                    for ny, nx in ((y - 1, x), (y + 1, x), (y, x - 1), (y, x + 1)):
+                        if 0 <= ny < H and 0 <= nx < W and mask[ny, nx] and not visited[ny, nx]:
+                            visited[ny, nx] = True
+                            q.append((ny, nx))
+                            ys.append(ny)
+                            xs.append(nx)
 
-        # Ràng buộc 1: Trong Block Blast, mỗi viên gạch con LUÔN LÀ HÌNH VUÔNG (tỷ lệ 1:1)
-        aspect_err = abs(u_w - u_h) / max(u_w, u_h)
-        if aspect_err > 0.32:
-            continue
-
-        # Ràng buộc 2: Kích thước viên gạch ở khay chờ nằm trong khoảng 0.30 -> 0.55 lần ô bàn cờ
-        scale_ratio = u_avg / cw
-        if scale_ratio < 0.26 or scale_ratio > 0.62:
-            continue
-
-        # Chấm điểm độ khít của từng ô trong lưới rows x cols
-        cell_match_sum = 0.0
-        total_cells = rows * cols
-
-        for r in range(rows):
-            for c in range(cols):
-                # Lấy 60% vùng lõi ở giữa mỗi ô để tránh viền vát cạnh
-                cx0 = max(0, int(round(min_x + (c + 0.20) * u_w)))
-                cx1 = min(sw, int(round(min_x + (c + 0.80) * u_w)))
-                cy0 = max(0, int(round(min_y + (r + 0.20) * u_h)))
-                cy1 = min(sh, int(round(min_y + (r + 0.80) * u_h)))
-
-                if cx1 <= cx0 or cy1 <= cy0:
+                area = len(xs)
+                if area < 14:
                     continue
 
-                sub_mask = piece_mask[cy0:cy1, cx0:cx1]
-                fill_ratio = float(sub_mask.mean()) if sub_mask.size > 0 else 0.0
+                # Nếu cụm chạm sát mép trên/dưới (dính viền bàn cờ hoặc banner quảng cáo) -> phạt nặng
+                mean_y = sum(ys) / area
+                mean_x = sum(xs) / area
+                dist = ((mean_y - cy_mid) ** 2 + (mean_x - cx_mid) ** 2) ** 0.5
+                penalty = 500.0 if touches_top_or_bot else 0.0
+                score = area - dist * 2.2 - penalty
 
-                if template[r][c] == 1:
-                    # Ô có gạch: thưởng cao nếu fill_ratio cao
-                    cell_match_sum += fill_ratio
-                else:
-                    # Ô trống (khuyết như L, T, Plus): thưởng cao nếu fill_ratio thấp
-                    cell_match_sum += (1.0 - fill_ratio)
+                if score > best_score:
+                    best_score = score
+                    best_blob = (np.array(ys), np.array(xs))
 
-        match_score = (cell_match_sum / total_cells) - aspect_err * 0.9
-
-        # Thưởng nhẹ cho mẫu có kích thước ô khay chuẩn (~0.44 * cw)
-        size_err = abs(scale_ratio - 0.44)
-        match_score -= size_err * 0.25
-
-        if match_score > best_score:
-            best_score = match_score
-            best_matrix = template
-
-    return best_matrix
+    return best_blob
 
 
 def detect_three_dock_pieces(arr, bx, by, bw):
     """
-    Định vị vùng khay dưới bàn cờ và nhận diện chính xác 3 khối chờ
-    bằng cách so khớp danh mục mẫu khối chuẩn Block Blast (loại bỏ hoàn toàn lỗi 2x5).
+    Định vị vùng khay dưới bàn cờ (tránh hoàn toàn viền đáy bàn cờ và banner quảng cáo dưới cùng),
+    sau đó đo kích thước từng khối theo đơn vị ô chuẩn u để lấy ma trận chính xác.
     """
     h, w, _ = arr.shape
     cw = bw / 8.0
 
-    # Khung dọc khay chờ: từ sau đáy bàn cờ đến trước banner quảng cáo đáy
-    dock_y0 = int(round(by + bw + cw * 0.38))
-    dock_y1 = min(int(round(h * 0.865)), int(round(by + bw + cw * 4.10)))
+    # Khoảng cách từ đáy bàn cờ xuống khay: bắt đầu sau đáy bàn cờ tối thiểu 0.45*cw
+    # và kết thúc trước vùng banner quảng cáo đáy màn hình (h * 0.86)
+    search_y0 = int(round(by + bw + cw * 0.42))
+    search_y1 = min(int(round(h * 0.855)), int(round(by + bw + cw * 3.85)))
 
-    if dock_y1 - dock_y0 < 35:
-        dock_y0 = int(round(by + bw + 10))
-        dock_y1 = min(h - 10, dock_y0 + int(round(cw * 3.2)))
+    if search_y1 - search_y0 < 30:
+        search_y0 = int(round(by + bw + 8))
+        search_y1 = min(h - 10, search_y0 + int(round(cw * 3.0)))
+
+    dock_band = arr[search_y0:search_y1, bx : bx + bw]
+    # Màu nền chung của vùng khay (hồng nhạt hoặc xanh đậm) lấy từ median toàn dải
+    dock_bg = np.median(dock_band.reshape(-1, 3), axis=0)
+
+    # Tìm tâm dọc (center_y) nơi có mật độ khối cao nhất để cắt khung khay chuẩn xác
+    band_diff = np.linalg.norm(dock_band - dock_bg, axis=2)
+    row_activity = (band_diff > 20.0).mean(axis=1)
+    active_rows = np.where(row_activity > 0.04)[0]
+
+    if len(active_rows) > 4:
+        ry0 = max(0, int(active_rows.min()) - int(cw * 0.35))
+        ry1 = min(dock_band.shape[0], int(active_rows.max()) + int(cw * 0.35))
+    else:
+        ry0 = 0
+        ry1 = dock_band.shape[0]
+
+    dock_y0 = search_y0 + ry0
+    dock_y1 = search_y0 + ry1
 
     slot_w = bw / 3.0
+    # Trong Block Blast, 1 ô gạch ở khay chờ có kích thước bằng ~0.465 lần ô bàn cờ
+    # (Riêng thanh 5 ô 1x5 hoặc 5x1 sẽ thu nhỏ nhẹ còn ~0.415 lần ô bàn cờ)
+    unit_std = cw * 0.465
+
     pieces = []
     slot_names = ["TRÁI", "GIỮA", "PHẢI"]
 
     for s in range(3):
-        sx0 = max(0, int(round(bx + s * slot_w + 3)))
-        sx1 = min(w, int(round(bx + (s + 1) * slot_w - 3)))
+        sx0 = int(round(bx + s * slot_w + 4))
+        sx1 = int(round(bx + (s + 1) * slot_w - 4))
         slot_arr = arr[dock_y0:dock_y1, sx0:sx1]
+        sh, sw, _ = slot_arr.shape
+        if sh < 10 or sw < 10:
+            continue
 
-        best_mat = match_best_canonical_shape(slot_arr, cw)
-        if best_mat is not None:
+        # Lấy màu nền cục bộ từ mép trái/phải của slot
+        edge_px = np.concatenate([
+            slot_arr[:, :3, :].reshape(-1, 3),
+            slot_arr[:, -3:, :].reshape(-1, 3),
+        ], axis=0)
+        local_bg = np.median(edge_px, axis=0)
+
+        color_dist = np.linalg.norm(slot_arr - local_bg, axis=2)
+        gray = slot_arr.mean(axis=2)
+        gx = np.abs(np.diff(gray, axis=1, prepend=gray[:, :1]))
+        gy = np.abs(np.diff(gray, axis=0, prepend=gray[:1, :]))
+
+        # Kết hợp độ lệch màu và cạnh vát 3D của viên gạch
+        act = color_dist * 1.15 + (gx + gy) * 1.35
+        act[:2, :] = 0
+        act[-2:, :] = 0
+        act[:, :2] = 0
+        act[:, -2:] = 0
+
+        blob = None
+        for thresh in (25.0, 19.0, 14.5):
+            m = act > thresh
+            b = extract_clean_piece_blob(m)
+            if b is not None and len(b[0]) >= 16:
+                blob = b
+                break
+
+        if blob is None:
+            continue
+
+        ys, xs = blob
+        min_x, max_x = int(np.percentile(xs, 1)), int(np.percentile(xs, 99))
+        min_y, max_y = int(np.percentile(ys, 1)), int(np.percentile(ys, 99))
+        bw_p = max_x - min_x + 1
+        bh_p = max_y - min_y + 1
+
+        if bw_p < 6 or bh_p < 6:
+            continue
+
+        # Xác định số hàng (rows) và số cột (cols) của khối dựa trên kích thước chuẩn
+        ratio_max = max(bw_p, bh_p) / unit_std
+        if ratio_max >= 3.65:
+            # Khối có chiều dài 4 hoặc 5 ô (thu nhỏ nhẹ trong khay)
+            u_eff = unit_std * 0.85
+        else:
+            u_eff = unit_std
+
+        cols = int(np.clip(round(bw_p / u_eff), 1, 5))
+        rows = int(np.clip(round(bh_p / u_eff), 1, 5))
+
+        # Tạo mask sạch của riêng cụm gạch
+        clean_mask = np.zeros((sh, sw), dtype=bool)
+        clean_mask[ys, xs] = True
+
+        mat = np.zeros((rows, cols), dtype=int)
+        sub_w = bw_p / float(cols)
+        sub_h = bh_p / float(rows)
+
+        for r in range(rows):
+            for c in range(cols):
+                # Lấy vùng lõi 65% giữa mỗi ô con để kiểm tra có gạch hay khuyết
+                cx0 = int(round(min_x + (c + 0.18) * sub_w))
+                cx1 = int(round(min_x + (c + 0.82) * sub_w))
+                cy0 = int(round(min_y + (r + 0.18) * sub_h))
+                cy1 = int(round(min_y + (r + 0.82) * sub_h))
+
+                sub_m = clean_mask[max(0, cy0) : min(sh, cy1 + 1), max(0, cx0) : min(sw, cx1 + 1)]
+                sub_act = act[max(0, cy0) : min(sh, cy1 + 1), max(0, cx0) : min(sw, cx1 + 1)]
+
+                if sub_m.size > 0 and (sub_m.mean() >= 0.32 or sub_act.mean() >= 22.0):
+                    mat[r, c] = 1
+
+        valid_r = np.any(mat == 1, axis=1)
+        valid_c = np.any(mat == 1, axis=0)
+        if np.any(valid_r) and np.any(valid_c):
+            mat_list = mat[valid_r][:, valid_c].tolist()
             pieces.append({
                 "slot": s + 1,
                 "name": slot_names[s],
-                "matrix": best_mat,
-                "placements": precompute_placements(best_mat),
+                "matrix": mat_list,
+                "placements": precompute_placements(mat_list),
             })
 
     return pieces
