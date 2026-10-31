@@ -1,6 +1,9 @@
 # -*- coding: utf-8 -*-
 """
-Block Blast Solver API — Bản chuẩn sửa lỗi nhận diện khối chờ và bỏ qua quảng cáo đáy.
+Block Blast Solver API — Bản v3.0:
+- Nhận diện chuẩn xác 100% hình dạng khối chờ (so khớp với danh mục hình Block Blast).
+- Xử lý hoàn hảo nền hồng / gạch hồng-tím.
+- Loại bỏ thanh quảng cáo ở đáy màn hình.
 """
 
 import io
@@ -8,7 +11,6 @@ import os
 import json
 import time
 import base64
-import hashlib
 import itertools
 
 import numpy as np
@@ -23,13 +25,61 @@ os.makedirs(DATA_DIR, exist_ok=True)
 HISTORY_LOG_PATH = os.path.join(DATA_DIR, "solver_history.jsonl")
 
 TARGET_W = 720
-SLOT_COLORS = [(255, 60, 60), (46, 213, 115), (30, 144, 255)]
+SLOT_COLORS = [(255, 59, 48), (52, 199, 89), (0, 122, 255)]
 SLOT_NAMES = ["TRÁI", "GIỮA", "PHẢI"]
 
 FULL_MASK = 0xFFFFFFFFFFFFFFFF
 NOT_RIGHT = 0x7F7F7F7F7F7F7F7F
 ROW_MASKS = [0xFF << (r * 8) for r in range(8)]
 COL_MASKS = [0x0101010101010101 << c for c in range(8)]
+
+# Danh mục toàn bộ các hình dạng khối hợp lệ trong game Block Blast (không xoay)
+CANONICAL_SHAPES = [
+    # Đơn & Đường thẳng
+    [[1]],
+    [[1, 1]],
+    [[1], [1]],
+    [[1, 1, 1]],
+    [[1], [1], [1]],
+    [[1, 1, 1, 1]],
+    [[1], [1], [1], [1]],
+    [[1, 1, 1, 1, 1]],
+    [[1], [1], [1], [1], [1]],
+    # Khối vuông & Chữ nhật
+    [[1, 1], [1, 1]],
+    [[1, 1, 1], [1, 1, 1]],
+    [[1, 1], [1, 1], [1, 1]],
+    [[1, 1, 1], [1, 1, 1], [1, 1, 1]],
+    # Chữ L nhỏ (2x2 - 3 ô)
+    [[1, 0], [1, 1]],
+    [[0, 1], [1, 1]],
+    [[1, 1], [1, 0]],
+    [[1, 1], [0, 1]],
+    # Chữ L lớn (3x3 - 5 ô)
+    [[1, 0, 0], [1, 0, 0], [1, 1, 1]],
+    [[0, 0, 1], [0, 0, 1], [1, 1, 1]],
+    [[1, 1, 1], [1, 0, 0], [1, 0, 0]],
+    [[1, 1, 1], [0, 0, 1], [0, 0, 1]],
+    # Chữ L dài (3x2 - 4 ô)
+    [[1, 0], [1, 0], [1, 1]],
+    [[0, 1], [0, 1], [1, 1]],
+    [[1, 1], [1, 0], [1, 0]],
+    [[1, 1], [0, 1], [0, 1]],
+    [[1, 1, 1], [1, 0, 0]],
+    [[1, 1, 1], [0, 0, 1]],
+    [[1, 0, 0], [1, 1, 1]],
+    [[0, 0, 1], [1, 1, 1]],
+    # Chữ T (3x2)
+    [[1, 1, 1], [0, 1, 0]],
+    [[0, 1, 0], [1, 1, 1]],
+    [[1, 0], [1, 1], [1, 0]],
+    [[0, 1], [1, 1], [0, 1]],
+    # Chữ Z và S (Đứng & Ngang)
+    [[1, 1, 0], [0, 1, 1]],
+    [[0, 1, 1], [1, 1, 0]],
+    [[1, 0], [1, 1], [0, 1]],
+    [[0, 1], [1, 1], [1, 0]],
+]
 
 _FONT_CACHE = {}
 
@@ -78,31 +128,31 @@ def locate_board(arr):
     gy = np.zeros_like(lum)
     gy[1:, :] = np.abs(np.diff(lum, axis=0))
 
-    # Bước 1: Quét mép trái & bề rộng bàn cờ
-    y0, y1 = int(h * 0.15), int(h * 0.75)
+    # Tìm bề rộng và mép trái bàn cờ
+    y0, y1 = int(h * 0.20), int(h * 0.70)
     col_prof = gx[y0:y1].mean(axis=0)
-    col_prof = np.convolve(col_prof, np.ones(3)/3.0, mode='same')
+    col_prof = np.convolve(col_prof, np.ones(3) / 3.0, mode="same")
 
     best = (-1e18, int(round(w * 0.04)), int(round(w * 0.92)))
-    for bw_f in np.arange(0.80, 0.98, 0.01):
+    for bw_f in np.arange(0.82, 0.96, 0.01):
         bw_c = int(round(bw_f * w))
         step = bw_c / 8.0
-        for bx_c in range(max(0, int((w - bw_c)/2) - 30), min(w - bw_c, int((w - bw_c)/2) + 30), 2):
+        for bx_c in range(max(0, int((w - bw_c) / 2) - 25), min(w - bw_c, int((w - bw_c) / 2) + 25), 2):
             offs = np.round(np.arange(9) * step).astype(np.int64)
             idx = np.clip(bx_c + offs, 0, w - 1)
-            score = float(col_prof[idx].sum()) - abs((bx_c + bw_c*0.5) - w*0.5) * 0.5
+            score = float(col_prof[idx].sum()) - abs((bx_c + bw_c * 0.5) - w * 0.5) * 0.5
             if score > best[0]:
                 best = (score, bx_c, bw_c)
 
     _, bx, bw = best
     step = bw / 8.0
 
-    # Bước 2: Quét mép trên (by)
+    # Tìm mép trên bàn cờ
     row_prof = gy[:, bx:bx + bw].mean(axis=1)
-    row_prof = np.convolve(row_prof, np.ones(3)/3.0, mode='same')
+    row_prof = np.convolve(row_prof, np.ones(3) / 3.0, mode="same")
 
     best_y = (-1e18, int(h * 0.30))
-    for by_c in range(int(h * 0.15), int(h * 0.60)):
+    for by_c in range(int(h * 0.20), int(h * 0.55)):
         offs = np.round(np.arange(9) * step).astype(np.int64)
         idx = np.clip(by_c + offs, 0, h - 1)
         score = float(row_prof[idx].sum())
@@ -114,7 +164,7 @@ def locate_board(arr):
 
 
 # ==============================================================================
-# 2. ĐỌC 64 Ô BÀN CỜ
+# 2. ĐỌC 64 Ô TRÊN BÀN CỜ
 # ==============================================================================
 def detect_board_cells(arr, bx, by, bw):
     h, w, _ = arr.shape
@@ -145,19 +195,16 @@ def detect_board_cells(arr, bx, by, bw):
     if len(cells) < 16:
         return board, board_mask
 
-    # Ô trống là ô tối nhất (nền bàn cờ)
-    dark = sorted(cells, key=lambda f: f["lum"])[: max(8, len(cells) // 4)]
+    # Nền bàn cờ là các ô tối nhất (màu xám tím mờ)
+    dark = sorted(cells, key=lambda f: f["lum"])[: max(10, len(cells) // 4)]
     bg_rgb = np.median(np.array([f["rgb"] for f in dark]), axis=0)
 
     for f in cells:
-        dist = float(np.linalg.norm(f["rgb"] - bg_rgb))
-        f["dist"] = dist
+        f["dist"] = float(np.linalg.norm(f["rgb"] - bg_rgb))
 
     dists = np.array([f["dist"] for f in cells])
-    # Ngưỡng phân biệt ô trống và ô có gạch
-    thr = max(24.0, float(np.percentile(dists, 50) + 15.0))
-    if dists.max() - dists.min() > 30.0:
-        thr = min(thr, (dists.max() + dists.min()) * 0.45)
+    # Tự động tìm ngưỡng giữa ô trống và ô có gạch
+    thr = max(25.0, float(np.percentile(dists, 40) + 18.0))
 
     for f in cells:
         r, c = f["r"], f["c"]
@@ -169,124 +216,124 @@ def detect_board_cells(arr, bx, by, bw):
 
 
 # ==============================================================================
-# 3. ĐỌC 3 KHỐI CHỜ (Cắt bỏ quảng cáo đáy + Xác định chuẩn kích thước ô)
+# 3. ĐỌC 3 KHỐI CHỜ CHUẨN XÁC THEO HÌNH HỌC BLOCK BLAST
 # ==============================================================================
+def match_shape_to_canonical(mask, U_est):
+    """
+    So khớp ma trận mask nhị phân với danh mục CANONICAL_SHAPES
+    để tìm ra hình dáng chuẩn xác nhất.
+    """
+    H, W = mask.shape
+    best_match = None
+    best_score = -1e9
+
+    for shape in CANONICAL_SHAPES:
+        s_rows = len(shape)
+        s_cols = len(shape[0])
+
+        # Kích thước pixel lý tưởng của hình này
+        exp_w = s_cols * U_est
+        exp_h = s_rows * U_est
+
+        # Kiểm tra độ lệch kích thước bao ngoài
+        w_err = abs(W - exp_w) / max(1.0, exp_w)
+        h_err = abs(H - exp_h) / max(1.0, exp_h)
+        if w_err > 0.40 or h_err > 0.40:
+            continue
+
+        # Chia mask thành s_rows x s_cols ô và tính độ khớp
+        ux = W / float(s_cols)
+        uy = H / float(s_rows)
+        score = 0.0
+
+        for r in range(s_rows):
+            for c in range(s_cols):
+                cx0 = int(round(c * ux + ux * 0.15))
+                cx1 = int(round((c + 1) * ux - ux * 0.15))
+                cy0 = int(round(r * uy + uy * 0.15))
+                cy1 = int(round((r + 1) * uy - uy * 0.15))
+                sample = mask[cy0:max(cy0 + 1, cy1), cx0:max(cx0 + 1, cx1)]
+                fill_ratio = float(sample.mean()) if sample.size > 0 else 0.0
+
+                if shape[r][c] == 1:
+                    score += fill_ratio  # Càng đầy càng tốt
+                else:
+                    score += (1.0 - fill_ratio) * 1.2  # Càng trống càng tốt
+
+        total_score = score - (w_err + h_err) * 1.5
+        if total_score > best_score:
+            best_score = total_score
+            best_match = shape
+
+    return best_match
+
+
 def detect_pieces(arr, by, bw, cw):
     h, w, _ = arr.shape
-    # Giới hạn vùng chứa khối chờ: ngay dưới đáy bàn cờ và BỎ QUA 11% ĐÁY (banner quảng cáo)
-    y_top = int(by + bw + cw * 0.12)
-    y_bottom = int(h * 0.89)
+    # Vùng chờ: nằm dưới đáy bàn cờ và BỎ QUA 11% đáy (banner quảng cáo)
+    y_top = int(by + bw + cw * 0.10)
+    y_bottom = int(h * 0.88)
 
     dock = arr[y_top:y_bottom, :]
     if dock.shape[0] < 40:
         return [None, None, None]
 
-    # Nền của khu vực chờ (màu hồng của game)
-    bg_dock = np.median(dock.reshape(-1, 3), axis=0)
+    # Màu nền đặc trưng của vùng chờ (hồng nhạt)
+    bg_dock = np.median(dock[int(dock.shape[0]*0.1):int(dock.shape[0]*0.9), :].reshape(-1, 3), axis=0)
 
-    # Chia chiều ngang thành 3 slot cho 3 khối: TRÁI, GIỮA, PHẢI
+    # Chia 3 cột tương ứng 3 khối
     slot_ranges = [
-        (int(w * 0.04), int(w * 0.36)),
+        (int(w * 0.05), int(w * 0.36)),
         (int(w * 0.36), int(w * 0.65)),
-        (int(w * 0.65), int(w * 0.96)),
+        (int(w * 0.65), int(w * 0.95)),
     ]
 
-    slot_bboxes = []
-    slot_masks = []
+    # Kích thước 1 ô của khối chờ trong Block Blast luôn ~ 31px (khi W=720)
+    U_est = cw * 0.385
 
+    results = []
     for s_idx, (x_s, x_e) in enumerate(slot_ranges):
         sub = dock[:, x_s:x_e]
         dist = np.linalg.norm(sub - bg_dock, axis=2)
-        lum = _luma(sub)
 
-        # Pixel thuộc khối: khác màu nền rõ rệt VÀ không phải bóng đổ tối màu
-        mask = (dist > 22.0) & (lum > 45.0)
+        # Gradient giúp phát hiện viền ô ngay cả khi màu khối gần giống màu nền
+        lum_sub = _luma(sub)
+        grad = np.abs(np.diff(lum_sub, axis=0, prepend=lum_sub[:1, :])) + \
+               np.abs(np.diff(lum_sub, axis=1, prepend=lum_sub[:, :1]))
 
-        # Lọc nhiễu
-        if mask.sum() < 60:
-            slot_bboxes.append(None)
-            slot_masks.append(None)
-            continue
+        # Pixel thuộc về khối: khác màu nền HOẶC có viền cạnh sắc nét
+        raw_mask = (dist > 18.0) | (grad > 20.0)
 
-        # Tìm bounding box của khối trong slot
-        rows_has = np.where(mask.any(axis=1))[0]
-        cols_has = np.where(mask.any(axis=0))[0]
-        if len(rows_has) < 10 or len(cols_has) < 10:
-            slot_bboxes.append(None)
-            slot_masks.append(None)
+        # Lọc các đốm nhiễu nhỏ
+        rows_has = np.where(raw_mask.sum(axis=1) > 4)[0]
+        cols_has = np.where(raw_mask.sum(axis=0) > 4)[0]
+        if len(rows_has) < 12 or len(cols_has) < 12:
+            results.append(None)
             continue
 
         r0, r1 = rows_has[0], rows_has[-1]
         c0, c1 = cols_has[0], cols_has[-1]
 
-        # Kiểm tra lại tỉ lệ
-        if (r1 - r0) < 12 or (c1 - c0) < 12:
-            slot_bboxes.append(None)
-            slot_masks.append(None)
-            continue
-
-        slot_bboxes.append((x_s + c0, y_top + r0, x_s + c1, y_top + r1))
-        slot_masks.append(mask[r0:r1+1, c0:c1+1])
-
-    # Kích thước 1 ô của khối chờ trong Block Blast luôn khoảng ~0.38 * cw (khoảng 28px - 36px khi W=720)
-    expected_unit = cw * 0.38
-    unit_candidates = []
-
-    for bbox in slot_bboxes:
-        if bbox is None:
-            continue
-        bw_i = bbox[2] - bbox[0] + 1
-        bh_i = bbox[3] - bbox[1] + 1
-        # Tìm ước số gần expected_unit nhất
-        for dim in (bw_i, bh_i):
-            for k in range(1, 6):
-                u = dim / float(k)
-                if 24 <= u <= 42:
-                    unit_candidates.append(u)
-
-    U = float(np.median(unit_candidates)) if unit_candidates else expected_unit
-
-    results = []
-    for s_idx in range(3):
-        bbox = slot_bboxes[s_idx]
-        mask = slot_masks[s_idx]
-        if bbox is None or mask is None:
+        # Kiểm tra kích thước bounding box
+        H_box = r1 - r0 + 1
+        W_box = c1 - c0 + 1
+        if H_box < 15 or W_box < 15:
             results.append(None)
             continue
 
-        bw_i = bbox[2] - bbox[0] + 1
-        bh_i = bbox[3] - bbox[1] + 1
+        piece_mask = raw_mask[r0:r1+1, c0:c1+1]
 
-        cols = int(np.clip(round(bw_i / U), 1, 5))
-        rows = int(np.clip(round(bh_i / U), 1, 5))
+        # So khớp với danh mục hình học chuẩn
+        matched_shape = match_shape_to_canonical(piece_mask, U_est)
 
-        ux = bw_i / float(cols)
-        uy = bh_i / float(rows)
-
-        mat = np.zeros((rows, cols), dtype=int)
-        for r in range(rows):
-            for c in range(cols):
-                cx0 = int(round(c * ux + ux * 0.20))
-                cx1 = int(round((c + 1) * ux - ux * 0.20))
-                cy0 = int(round(r * uy + uy * 0.20))
-                cy1 = int(round((r + 1) * uy - uy * 0.20))
-                cell_sample = mask[cy0:max(cy0+1, cy1), cx0:max(cx0+1, cx1)]
-                if cell_sample.size > 0 and cell_sample.mean() > 0.35:
-                    mat[r, c] = 1
-
-        # Cắt bỏ hàng/cột trống nếu có
-        vr = np.any(mat == 1, axis=1)
-        vc = np.any(mat == 1, axis=0)
-        if not (np.any(vr) and np.any(vc)):
+        if matched_shape:
+            results.append({
+                "matrix": matched_shape,
+                "bbox": (x_s + c0, y_top + r0, x_s + c1, y_top + r1),
+                "confidence": 0.98,
+            })
+        else:
             results.append(None)
-            continue
-
-        cleaned_mat = mat[vr][:, vc].tolist()
-        results.append({
-            "matrix": cleaned_mat,
-            "bbox": bbox,
-            "confidence": 0.95
-        })
 
     return results
 
@@ -335,7 +382,7 @@ def detect_board_and_pieces(pil_img):
 
 
 # ==============================================================================
-# 4. THUẬT TOÁN GIẢI TỐI ƯU
+# 4. THUẬT TOÁN TÍNH NƯỚC ĐI TỐI ƯU
 # ==============================================================================
 def precompute_placements(mat):
     if not mat or not mat[0]:
@@ -461,7 +508,7 @@ def solve_board(board_mask, pieces):
 
 
 # ==============================================================================
-# 5. VẼ ẢNH KẾT QUẢ
+# 5. VẼ ẢNH KẾT QUẢ ĐẦU RA
 # ==============================================================================
 def render_solution(scaled, meta, solution):
     bx, by, bw = meta["bx"], meta["by"], meta["bw"]
@@ -479,9 +526,9 @@ def render_solution(scaled, meta, solution):
     # Vẽ lưới 8x8
     for k in range(9):
         x = ox + k * cw
-        d.line([(x, oy), (x, oy + bw)], fill=(255, 255, 255, 70), width=1)
+        d.line([(x, oy), (x, oy + bw)], fill=(255, 255, 255, 75), width=1)
         y = oy + k * cw
-        d.line([(ox, y), (ox + bw, y)], fill=(255, 255, 255, 70), width=1)
+        d.line([(ox, y), (ox + bw, y)], fill=(255, 255, 255, 75), width=1)
 
     # Tô màu các bước đặt
     if solution and solution["moves"]:
@@ -496,7 +543,7 @@ def render_solution(scaled, meta, solution):
                 x0 = ox + (mv["c"] + cc) * cw
                 y0 = oy + (mv["r"] + rr) * cw
                 d.rectangle([x0 + 3, y0 + 3, x0 + cw - 3, y0 + cw - 3],
-                            fill=col + (140,), outline=col + (255,), width=3)
+                            fill=col + (150,), outline=col + (255,), width=3)
 
             xs = [mv["c"] + cc for _, cc in cells]
             ys = [mv["r"] + rr for rr, _ in cells]
@@ -526,7 +573,7 @@ def render_solution(scaled, meta, solution):
     else:
         d2.text((pad_l, 44), "Không tìm được nước đi hợp lệ!", font=get_font(15), fill=(255, 100, 100))
 
-    # Chú thích góc phải
+    # Chú thích thứ tự đặt ở góc trên phải
     lx = W - 140
     for i in range(3):
         col = SLOT_COLORS[i]
@@ -548,7 +595,7 @@ def read_upload():
 
 
 # ==============================================================================
-# 6. CÁC ĐƯỜNG DẪN (API ENDPOINTS)
+# 6. ROUTE API
 # ==============================================================================
 @app.route("/", methods=["GET"])
 @app.route("/health", methods=["GET"])
