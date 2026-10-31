@@ -15,7 +15,7 @@ from flask import Flask, request, send_file, jsonify, Response
 app = Flask(__name__)
 
 # ==============================================================================
-# CẤU HÌNH LƯU TRỮ PHIÊN KIỂM CHỨNG & LỊCH SỬ GIẢI (ĐẢM BẢO TÁI LẬP KẾT QUẢ)
+# CẤU HÌNH LƯU TRỮ PHIÊN KIỂM CHỨNG & LỊCH SỬ GIẢI
 # ==============================================================================
 DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "solver_data")
 os.makedirs(DATA_DIR, exist_ok=True)
@@ -24,7 +24,6 @@ SESSIONS_CACHE = {}
 
 # ==============================================================================
 # HẰNG SỐ BITBOARD 64-BIT
-# Ô (r, c) với r in [0..7], c in [0..7] ứng với bit: (r * 8 + c)
 # ==============================================================================
 FULL_MASK = 0xFFFFFFFFFFFFFFFF
 NOT_RIGHT = 0x7F7F7F7F7F7F7F7F
@@ -34,19 +33,14 @@ COL_MASKS = [0x0101010101010101 << c for c in range(8)]
 
 
 # ==============================================================================
-# 1. HỆ THỐNG XỬ LÝ ẢNH & NHẬN DIỆN ĐỘ CHÍNH XÁC CAO (HIGH-RES GEOMETRIC VISION)
+# 1. HỆ THỐNG XỬ LÝ ẢNH & NHẬN DIỆN ĐỘ CHÍNH XÁC CAO
 # ==============================================================================
 def compute_image_sha256(pil_img):
-    """Tạo mã băm cố định cho ảnh đầu vào để kiểm chứng tính bất biến."""
     raw_bytes = pil_img.convert("RGB").tobytes()
     return hashlib.sha256(raw_bytes).hexdigest()[:16]
 
 
 def normalize_image(pil_img, target_w=720):
-    """
-    Chuẩn hóa ảnh về chiều rộng 720px (gấp đôi bản cũ) để giữ nguyên độ nét
-    của các rãnh ngăn cách 2-4px giữa các ô gạch trong khu vực chờ.
-    """
     rgb_img = pil_img.convert("RGB")
     if rgb_img.width == target_w:
         scaled = rgb_img
@@ -59,26 +53,18 @@ def normalize_image(pil_img, target_w=720):
 
 
 def rgb_to_lum_chroma(arr):
-    """Tính kênh độ sáng (Luminance) và độ bão hòa màu (Chroma) từ mảng RGB."""
     lum = 0.299 * arr[:, :, 0] + 0.587 * arr[:, :, 1] + 0.114 * arr[:, :, 2]
     chroma = arr.max(axis=2) - arr.min(axis=2)
     return lum, chroma
 
 
 def auto_locate_board(rgb_arr):
-    """
-    Định vị chính xác khung bàn cờ 8x8 dựa trên:
-    1. Đạo hàm biên dọc & ngang của khung bàn cờ.
-    2. Tính đối xứng trái-phải của màn hình.
-    3. Điểm cộng hưởng chu kỳ của 7 đường lưới dọc và 7 đường lưới ngang nội bộ.
-    """
     h, w, _ = rgb_arr.shape
     lum, _ = rgb_to_lum_chroma(rgb_arr)
 
     vert_grad = np.abs(np.diff(lum, axis=0, prepend=lum[:1, :]))
     horiz_grad = np.abs(np.diff(lum, axis=1, prepend=lum[:, :1]))
 
-    # 1. Tìm biên trái (bx) và chiều rộng bàn cờ (bw)
     mid_y0, mid_y1 = int(h * 0.18), int(h * 0.65)
     col_edge_profile = horiz_grad[mid_y0:mid_y1, :].mean(axis=0)
 
@@ -100,7 +86,6 @@ def auto_locate_board(rgb_arr):
         r_idx = m + cand_bw
         r_peak = col_edge_profile[max(0, r_idx - 2) : min(w, r_idx + 3)].max()
 
-        # Cộng điểm cho 7 đường chia cột bên trong bàn cờ
         internal_v = 0.0
         for k in range(1, 8):
             gx = int(round(m + k * cw_cand))
@@ -114,9 +99,7 @@ def auto_locate_board(rgb_arr):
             best_bx = m
             best_bw = cand_bw
 
-    # 2. Tìm tọa độ đỉnh trên của bàn cờ (by)
     row_edge_profile = vert_grad[:, best_bx : best_bx + best_bw].mean(axis=1)
-    row_lum_profile = lum[:, best_bx : best_bx + best_bw].mean(axis=1)
 
     y_min = max(8, int(h * 0.11))
     y_max = min(int(h * 0.36), h - best_bw - 20)
@@ -137,7 +120,6 @@ def auto_locate_board(rgb_arr):
             if 2 <= gy < h - 2:
                 internal_h += row_edge_profile[gy - 2 : gy + 3].max()
 
-        # Vùng bên trong bàn cờ thường có viền tối rõ rệt ở mép trên/dưới
         score_y = top_peak + bot_peak * 0.92 + (internal_h / 7.0) * 0.85
         if score_y > best_y_score:
             best_y_score = score_y
@@ -147,18 +129,9 @@ def auto_locate_board(rgb_arr):
 
 
 def detect_board_cells(rgb_arr, bx, by, bw):
-    """
-    Phân tích 64 ô trên bàn cờ 8x8.
-    Trả về:
-      - board: ma trận 8x8 (0 hoặc 1)
-      - board_mask: số nguyên 64-bit
-      - cell_confidences: ma trận 8x8 chứa độ tin cậy [0.0 .. 1.0] của từng ô
-      - uncertain_cells: danh sách các ô có độ tin cậy thấp (< 0.72)
-    """
     cw = bw / 8.0
     lum_full, chroma_full = rgb_to_lum_chroma(rgb_arr)
 
-    # Lấy mẫu màu rãnh lưới (mortar lines) giữa các ô để làm mốc nền tối chuẩn
     seam_samples = []
     for k in range(1, 8):
         gy = int(round(by + k * cw))
@@ -180,14 +153,12 @@ def detect_board_cells(rgb_arr, bx, by, bw):
             cell_w = max(8, x1 - x0)
             cell_h = max(8, y1 - y0)
 
-            # Vùng lõi ô (bỏ 14% rìa ngoài để tránh đường kẻ lưới)
             pad_x = max(2, int(round(cell_w * 0.14)))
             pad_y = max(2, int(round(cell_h * 0.14)))
             core_rgb = rgb_arr[y0 + pad_y : y1 - pad_y, x0 + pad_x : x1 - pad_x]
             core_lum = lum_full[y0 + pad_y : y1 - pad_y, x0 + pad_x : x1 - pad_x]
             core_chroma = chroma_full[y0 + pad_y : y1 - pad_y, x0 + pad_x : x1 - pad_x]
 
-            # Vùng tâm phẳng (30%..70%) để đo màu mặt gạch chính xác
             in_x = max(3, int(round(cell_w * 0.28)))
             in_y = max(3, int(round(cell_h * 0.28)))
             center_rgb = rgb_arr[y0 + in_y : y1 - in_y, x0 + in_x : x1 - in_x]
@@ -197,7 +168,6 @@ def detect_board_cells(rgb_arr, bx, by, bw):
             mean_lum = float(core_lum.mean()) if core_lum.size > 0 else 0.0
             mean_chroma = float(core_chroma.mean()) if core_chroma.size > 0 else 0.0
 
-            # Đo hiệu ứng vát cạnh 3D (Bevel): gạch thật luôn có gờ trên/trái sáng và gờ dưới/phải tối
             b_strip = max(2, int(round(core_lum.shape[0] * 0.22)))
             top_l = float(core_lum[:b_strip, :].mean())
             bot_l = float(core_lum[-b_strip:, :].mean())
@@ -206,8 +176,6 @@ def detect_board_cells(rgb_arr, bx, by, bw):
 
             abs_bevel = abs(top_l - bot_l) + abs(left_l - right_l)
             signed_bevel = max(0.0, top_l - bot_l) + max(0.0, left_l - right_l)
-
-            # Độ phẳng tổng hợp: ô trống có độ phẳng rất thấp (ít biến thiên, không có bevel, màu tối/ít bão hòa)
             flatness = std_lum * 1.1 + abs_bevel * 1.15 + mean_chroma * 0.45
 
             cell_feats.append({
@@ -222,7 +190,6 @@ def detect_board_cells(rgb_arr, bx, by, bw):
                 "flatness": flatness,
             })
 
-    # Xác định màu nền ô trống (Empty Cell Background Reference)
     sorted_flat = sorted(cell_feats, key=lambda x: x["flatness"])
     darkest_flat = [
         x for x in sorted_flat[:16]
@@ -236,13 +203,11 @@ def detect_board_cells(rgb_arr, bx, by, bw):
         ]
         bg_rgb = np.median(np.array(cluster), axis=0)
     else:
-        # Trường hợp cả 64 ô gần như đầy kín, dùng màu rãnh lưới làm mốc nền
         bg_rgb = seam_rgb * 1.12
 
     bg_lum = float(0.299 * bg_rgb[0] + 0.587 * bg_rgb[1] + 0.114 * bg_rgb[2])
     bg_chroma = float(bg_rgb.max() - bg_rgb.min())
 
-    # Tính điểm đặc trưng (Block Evidence Score) cho từng ô
     scores = []
     for f in cell_feats:
         color_dist = float(np.linalg.norm(f["rgb"] - bg_rgb))
@@ -260,18 +225,14 @@ def detect_board_cells(rgb_arr, bx, by, bw):
         f["evidence"] = evidence
         scores.append(evidence)
 
-    # Ngưỡng thích ứng kết hợp giới hạn vật lý (đảm bảo bàn cờ trống 100% không bị nhận nhầm)
     arr_s = np.asarray(scores, dtype=np.float32)
     s_min, s_max = float(arr_s.min()), float(arr_s.max())
 
     if s_max < 28.0:
-        # Tất cả các ô đều là ô trống
         decision_thresh = 32.0
     elif s_min > 48.0:
-        # Tất cả các ô đều đã có gạch
         decision_thresh = 30.0
     else:
-        # Tìm ngưỡng phân tách tối ưu Otsu giữa cụm ô trống và cụm ô gạch
         best_t = 34.0
         best_var = -1.0
         for step in range(1, 64):
@@ -301,7 +262,6 @@ def detect_board_cells(rgb_arr, bx, by, bw):
             board[r][c] = 1
             board_mask |= (1 << (r * 8 + c))
 
-        # Tính độ tin cậy dựa trên khoảng cách tới ngưỡng quyết định
         margin = abs(ev - decision_thresh)
         conf = float(np.clip(0.50 + (margin / 28.0) * 0.50, 0.50, 0.999))
         cell_confidences[r][c] = round(conf, 3)
@@ -312,10 +272,6 @@ def detect_board_cells(rgb_arr, bx, by, bw):
 
 
 def clean_connected_mask(raw_mask):
-    """
-    Lọc nhiễu hình thái học (Morphological Opening 3x3) và giữ lại các thành phần
-    liên thông thuộc về khối hình chính trong slot.
-    """
     sh, sw = raw_mask.shape
     if sh < 5 or sw < 5:
         return raw_mask
@@ -389,62 +345,9 @@ def clean_connected_mask(raw_mask):
     return cleaned
 
 
-def detect_seam_pitch(profile_grad, length, min_u, max_u):
-    """
-    Tìm bước lưới (tile pitch u) bằng tự tương quan đạo hàm rãnh ngăn cách nội bộ.
-    """
-    if length < int(min_u * 1.7):
-        return None, 0.0
-
-    best_u = None
-    best_response = 0.0
-    g = profile_grad.astype(np.float32)
-    g_mean = float(g.mean()) + 1e-5
-
-    for u_int in range(max(8, int(round(min_u))), min(length, int(round(max_u)) + 1)):
-        num_seams = int(round(length / float(u_int))) - 1
-        if num_seams < 1 or num_seams > 4:
-            continue
-        total_ count = num_seams + 1
-        step = length / float(total_count)
-        seam_vals = []
-        mid_vals = []
-        for k in range(1, total_count):
-            sx = int(round(k * step))
-            l_idx = max(0, sx - 2)
-            r_idx = min(length, sx + 3)
-            if r_idx > l_idx:
-                seam_vals.append(float(g[l_idx:r_idx].max()))
-        for k in range(total_count):
-            mx = int(round((k + 0.5) * step))
-            l_idx = max(0, mx - 2)
-            r_idx = min(length, mx + 3)
-            if r_idx > l_idx:
-                mid_vals.append(float(g[l_idx:r_idx].mean()))
-        if seam_vals and mid_vals:
-            ratio = (float(np.mean(seam_vals)) - float(np.mean(mid_vals))) / g_mean
-            if ratio > best_response:
-                best_response = ratio
-                best_u = step
-
-    return best_u, best_response
-
-
 def solve_piece_grid_dimensions(bw_p, bh_p, unit_base, roi_lum, roi_chroma, roi_mask):
-    """
-    Xác định số hàng (rows) và số cột (cols) của khối hình trong khu vực chờ bằng 4 tiêu chí hình học:
-    1. Tỷ lệ đồng dạng ô vuông (Squareness Constraint: u_x == u_y).
-       Mọi ô đơn vị trong Block Blast đều là hình vuông 1:1. Do đó:
-       - Thanh 1x4 luôn có tỷ lệ bw_p / bh_p ≈ 4.0
-       - Thanh 1x5 luôn có tỷ lệ bw_p / bh_p ≈ 5.0
-       Không phụ thuộc vào việc game phóng to hay thu nhỏ khối trong dock!
-    2. Khớp bước rãnh ngăn cách nội bộ (Internal Seam/Groove Alignment).
-    3. Quy luật tỷ lệ kích thước ô trong Dock theo số ô tối đa.
-    4. Mật độ lấp đầy từng ô con (Sub-cell Occupancy Clarity).
-    """
     aspect = float(bw_p) / max(1.0, float(bh_p))
 
-    # Tính biên độ biến thiên độ sáng tại các đường rãnh dọc và ngang bên trong khối
     col_lum = (roi_lum * roi_mask).sum(axis=0) / np.maximum(1.0, roi_mask.sum(axis=0))
     row_lum = (roi_lum * roi_mask).sum(axis=1) / np.maximum(1.0, roi_mask.sum(axis=1))
     col_grad = np.abs(np.diff(col_lum, prepend=col_lum[:1]))
@@ -458,35 +361,27 @@ def solve_piece_grid_dimensions(bw_p, bh_p, unit_base, roi_lum, roi_chroma, roi_
             uy = float(bh_p) / float(r)
             u_mean = 0.5 * (ux + uy)
 
-            # Giới hạn kích thước vật lý hợp lệ của 1 ô trong dock (tính theo unit_base)
             if u_mean < unit_base * 0.55 or u_mean > unit_base * 1.45:
                 continue
 
-            # Tiêu chí 1: Sai số hình vuông (Squareness & Aspect Ratio Error)
             sq_err = abs(ux - uy) / max(ux, uy)
             model_aspect = float(c) / float(r)
             aspect_err = abs(aspect - model_aspect) / max(aspect, model_aspect)
 
-            # Nếu sai lệch tỷ lệ hình vuông vượt quá 24%, loại ngay
             if sq_err > 0.24:
                 continue
 
-            # Tiêu chí 2: Sai số kích thước ô theo quy luật thu phóng của khu vực chờ
             max_dim_cells = max(r, c)
             if max_dim_cells == 5:
-                # Khối 5 ô thường có kích thước ô trong khoảng [0.78 .. 1.00] * unit_base
                 expected_u = float(np.clip(u_mean, unit_base * 0.80, unit_base * 0.98))
                 scale_err = abs(u_mean - expected_u) / unit_base
             elif max_dim_cells == 4:
-                # Khối 4 ô thường có kích thước ô trong khoảng [0.90 .. 1.06] * unit_base
                 expected_u = float(np.clip(u_mean, unit_base * 0.91, unit_base * 1.05))
                 scale_err = abs(u_mean - expected_u) / unit_base
             else:
-                # Khối 1..3 ô thường có kích thước ô trong khoảng [0.92 .. 1.12] * unit_base
                 expected_u = float(np.clip(u_mean, unit_base * 0.92, unit_base * 1.10))
                 scale_err = abs(u_mean - expected_u) / unit_base
 
-            # Tiêu chí 3: Năng lượng khớp rãnh ngăn cách giữa các ô (Seam Alignment)
             seam_score = 0.0
             if c > 1 and bw_p >= c * 10:
                 peaks = []
@@ -517,8 +412,6 @@ def solve_piece_grid_dimensions(bw_p, bh_p, unit_base, roi_lum, roi_chroma, roi_
                 seam_score += (float(np.mean(peaks)) - float(np.mean(mids))) / mean_grad
 
             seam_bonus = float(np.clip(seam_score * 0.045, -0.06, 0.12))
-
-            # Tổng chi phí (càng nhỏ càng khớp)
             total_cost = sq_err * 3.4 + aspect_err * 2.4 + scale_err * 1.5 - seam_bonus
             candidates.append((total_cost, r, c))
 
@@ -540,12 +433,6 @@ def solve_piece_grid_dimensions(bw_p, bh_p, unit_base, roi_lum, roi_chroma, roi_
 
 
 def extract_piece_from_slot(slot_arr, dock_bg_global, unit_base):
-    """
-    Phân tích 1 vùng chứa khối chờ xếp (slot):
-    - Bóc tách hoàn toàn bóng đổ dưới đáy và viền nhiễu.
-    - Xác định kích thước lưới (rows x cols) chính xác.
-    - Quét từng ô con (r, c) để tạo ma trận 0/1 và tính độ tin cậy.
-    """
     sh, sw, _ = slot_arr.shape
     if sh < 16 or sw < 16:
         return None
@@ -568,7 +455,6 @@ def extract_piece_from_slot(slot_arr, dock_bg_global, unit_base):
     lum_gain = np.maximum(0.0, lum - bg_lum)
     chroma_gain = np.maximum(0.0, chroma - bg_chroma)
 
-    # Loại bỏ bóng đổ (bóng đổ có độ sáng tối hơn hoặc gần bằng nền và độ bão hòa màu thấp)
     is_shadow = (lum < bg_lum + 7.5) & (chroma_gain < 20.0) & (color_diff < 52.0)
 
     fg_energy = color_diff * 0.85 + lum_gain * 0.65 + chroma_gain * 0.95
@@ -586,7 +472,6 @@ def extract_piece_from_slot(slot_arr, dock_bg_global, unit_base):
     if active.size < 40:
         return None
 
-    # Tính ngưỡng tách khối khỏi nền
     vmin, vmax = float(active.min()), float(active.max())
     best_t = (vmin + vmax) * 0.45
     best_var = -1.0
@@ -609,7 +494,6 @@ def extract_piece_from_slot(slot_arr, dock_bg_global, unit_base):
     if len(xs) < 40:
         return None
 
-    # Xác định biên thực của khối bằng mật độ theo hàng và cột
     col_counts = mask.sum(axis=0)
     row_counts = mask.sum(axis=1)
     vx = np.where(col_counts >= max(3, int(col_counts.max() * 0.14)))[0]
@@ -620,7 +504,6 @@ def extract_piece_from_slot(slot_arr, dock_bg_global, unit_base):
     min_x, max_x = int(vx[0]), int(vx[-1])
     min_y, max_y = int(vy[0]), int(vy[-1])
 
-    # Cắt gọt các dòng bóng đổ tối còn bám ở đáy dưới cùng của khối
     while max_y - min_y > 14:
         bot_mask = mask[max_y, min_x : max_x + 1]
         if np.any(bot_mask):
@@ -649,7 +532,6 @@ def extract_piece_from_slot(slot_arr, dock_bg_global, unit_base):
         bw_p, bh_p, unit_base, roi_lum, roi_chroma, roi_mask
     )
 
-    # Màu chuẩn của khối (mỗi khối chỉ có 1 màu đồng nhất)
     fg_pixels = slot_arr[mask]
     piece_rgb = np.median(fg_pixels, axis=0)
     fg_bg_dist = max(20.0, float(np.linalg.norm(piece_rgb - dock_bg)))
@@ -707,10 +589,6 @@ def extract_piece_from_slot(slot_arr, dock_bg_global, unit_base):
 
 
 def detect_board_and_pieces(pil_img):
-    """
-    Hàm nhận diện tổng thể Khu vực A (Bàn cờ 8x8) và Khu vực B (3 khối chờ xếp).
-    Trả về đầy đủ ma trận, bitmask, độ tin cậy và danh sách cảnh báo nếu có vùng chưa rõ ràng.
-    """
     img_hash = compute_image_sha256(pil_img)
     scaled_img, arr = normalize_image(pil_img, target_w=720)
     target_h, target_w, _ = arr.shape
@@ -720,7 +598,6 @@ def detect_board_and_pieces(pil_img):
 
     board, board_mask, cell_confs, uncertain_cells = detect_board_cells(arr, bx, by, bw)
 
-    # Định vị khu vực chờ xếp (Dock) phía dưới bàn cờ
     dock_y0 = min(target_h - 60, int(round(by + bw + max(cw * 0.42, target_h * 0.035))))
     safe_bottom = target_h - max(18, int(round(target_h * 0.038)))
     dock_y1 = min(safe_bottom, int(round(dock_y0 + max(cw * 3.15, target_h * 0.195))))
@@ -788,7 +665,7 @@ def detect_board_and_pieces(pil_img):
             uncertain_slots.append({
                 "slot": s + 1,
                 "name": slot_names[s],
-                "reason": f"Không phát hiện thấy khối ở vị trí {slot_names[s]} (trống hoặc quá mờ)",
+                "reason": f"Không phát hiện thấy khối ở vị trí {slot_names[s]}",
             })
 
     board_mean_conf = float(np.mean(cell_confs))
@@ -816,10 +693,9 @@ def detect_board_and_pieces(pil_img):
 
 
 # ==============================================================================
-# 2. CÔNG THỨC ĐIỂM SCORE THỰC TẾ & BỘ GIẢI VÉT CẠN TOÀN CỤC (EXHAUSTIVE SOLVER)
+# 2. CÔNG THỨC ĐIỂM SCORE THỰC TẾ & BỘ GIẢI VÉT CẠN TOÀN CỤC
 # ==============================================================================
 def precompute_placements(mat):
-    """Tạo sẵn danh sách bitmask 64-bit cho mọi vị trí đặt hợp lệ của một ma trận khối."""
     if not mat or not mat[0]:
         return []
     R, C = len(mat), len(mat[0])
@@ -839,19 +715,6 @@ def precompute_placements(mat):
 
 
 def compute_verified_block_blast_score(cells_placed, lines_cleared, current_combo_streak):
-    """
-    Tính điểm SCORE thực tế theo luật game Block Blast:
-    1. Điểm đặt khối (Placement Score): +1 điểm cho mỗi ô đơn vị của khối được đặt xuống.
-    2. Điểm xóa hàng/cột cơ sở (Line Clear Base Score):
-       - Xóa 1 hàng/cột: 10 điểm
-       - Xóa 2 hàng/cột cùng lúc: 30 điểm (10 * 2 * 3 / 2)
-       - Xóa 3 hàng/cột cùng lúc: 60 điểm
-       - Xóa 4 hàng/cột cùng lúc: 100 điểm
-       - Xóa L hàng/cột cùng lúc: 10 * L * (L + 1) // 2
-    3. Điểm thưởng chuỗi Combo (Combo Multiplier):
-       - Khi xóa được hàng/cột liên tiếp, điểm xóa hàng được nhân với hệ số (current_combo_streak + 1).
-    4. Điểm thưởng dọn sạch bàn cờ (All Clear Bonus): Đạt thêm thưởng nếu bàn cờ trống hoàn toàn.
-    """
     placement_pts = int(cells_placed)
     if lines_cleared <= 0:
         return placement_pts, 0, 0
@@ -864,10 +727,6 @@ def compute_verified_block_blast_score(cells_placed, lines_cleared, current_comb
 
 
 def simulate_bitboard(bmask, pmask, cells, combo_streak=0):
-    """
-    Mô phỏng đặt khối pmask lên bàn cờ bmask, kiểm tra xóa đồng thời cả hàng và cột,
-    cập nhật trạng thái bàn cờ mới và trả về điểm SCORE thực tế.
-    """
     nb = bmask | pmask
     clear_mask = 0
     rows_cleared = 0
@@ -886,10 +745,9 @@ def simulate_bitboard(bmask, pmask, cells, combo_streak=0):
     if clear_mask:
         nb &= ~clear_mask
 
-    step_score, clear_pts, next_combo = compute_verified_block_blast_score(
+    step_score, _, next_combo = compute_verified_block_blast_score(
         cells, lines, combo_streak
     )
-    # Thưởng dọn sạch toàn bộ bàn cờ (All-Clear)
     if clear_mask and nb == 0:
         step_score += 50
 
@@ -897,24 +755,15 @@ def simulate_bitboard(bmask, pmask, cells, combo_streak=0):
 
 
 def evaluate_positional_heuristic(b):
-    """
-    Hàm đánh giá thế cờ (Positional Heuristic) - TÁCH BIỆT HOÀN TOÀN với điểm SCORE thực tế.
-    Dùng để đánh giá chất lượng bàn cờ sau khi đã đặt xong các khối:
-    - Khả năng tạo lượt xóa tiếp theo (các hàng/cột đã có 6 hoặc 7 ô).
-    - Không gian trống để đặt các khối lớn ở lượt tiếp theo (3x3, 2x2, 1x5, 5x1, 1x4, 4x1).
-    - Hạn chế tối đa các lỗ trống 1x1 bị cô lập và sự phân mảnh bàn cờ.
-    """
     empty = 64 - b.bit_count()
     e = (~b) & FULL_MASK
 
-    # 1. Đếm không gian cho khối vuông 2x2 và 3x3
     eh2 = e & (e >> 1) & NOT_RIGHT
     space_2x2 = (eh2 & (eh2 >> 8)).bit_count()
 
     eh3 = eh2 & (e >> 2) & 0x3F3F3F3F3F3F3F3F
     space_3x3 = (eh3 & (eh3 >> 8) & (eh3 >> 16)).bit_count()
 
-    # 2. Đếm hành lang cho thanh dài 1x4, 4x1, 1x5, 5x1
     eh4 = eh2 & (eh2 >> 2) & 0x0F0F0F0F0F0F0F0F
     eh5 = eh4 & (e >> 4) & 0x0707070707070707
     ev2 = e & (e >> 8)
@@ -924,14 +773,12 @@ def evaluate_positional_heuristic(b):
     bars_4 = eh4.bit_count() + ev4.bit_count()
     bars_5 = eh5.bit_count() + ev5.bit_count()
 
-    # 3. Đếm lỗ đơn 1x1 bị vây kín 4 phía (rất khó lấp trong các lượt sau)
     up_occ = ((b << 8) & FULL_MASK) | 0xFF
     down_occ = (b >> 8) | 0xFF00000000000000
     left_occ = ((b << 1) & NOT_LEFT) | 0x0101010101010101
     right_occ = ((b >> 1) & NOT_RIGHT) | 0x8080808080808080
     isolated_1x1 = (e & up_occ & down_occ & left_occ & right_occ).bit_count()
 
-    # 4. Đánh giá các hàng/cột gần đầy (6 hoặc 7 ô) sẵn sàng nổ ở lượt kế tiếp
     near_clear_potential = 0.0
     for rm in ROW_MASKS:
         cnt = (b & rm).bit_count()
@@ -946,7 +793,6 @@ def evaluate_positional_heuristic(b):
         elif cnt == 6:
             near_clear_potential += 3.5
 
-    # 5. Độ chuyển tiếp biên (càng thấp các khối gạch càng chụm gọn về một phía)
     trans_h = ((b ^ (b >> 1)) & NOT_RIGHT).bit_count()
     trans_v = ((b ^ (b >> 8)) & 0x00FFFFFFFFFFFFFF).bit_count()
 
@@ -963,15 +809,6 @@ def evaluate_positional_heuristic(b):
 
 
 def build_solution_ranking_key(steps, total_game_score, total_lines, max_simul_lines, heur_score):
-    """
-    Khóa xếp hạng cố định (Deterministic Lexicographical Ranking Key):
-    1. Số lượng khối đặt được nhiều nhất (3 > 2 > 1).
-    2. Tổng điểm SCORE thực tế (total_game_score) cao nhất.
-    3. Tổng số hàng + cột xóa được (total_lines) nhiều nhất.
-    4. Số hàng/cột xóa đồng thời trong 1 nước (max_simul_lines) cao nhất.
-    5. Điểm đánh giá thế cờ (heuristic_score) làm tròn 4 chữ số thập phân.
-    6. Quy tắc phá hòa cố định tuyệt đối theo (-slot, -row, -col) để cùng dữ liệu luôn ra đúng 1 kết quả.
-    """
     tie_breaker = tuple((-st["slot"], -st["row"], -st["col"]) for st in steps)
     return (
         len(steps),
@@ -984,13 +821,6 @@ def build_solution_ranking_key(steps, total_game_score, total_lines, max_simul_l
 
 
 def solve_best_sequence(board_mask, pieces, return_details=False):
-    """
-    Thuật toán Tìm kiếm Vét cạn Toàn cục (100% Exhaustive Search với Bitboard Caching):
-    - Kiểm tra tất cả hoán vị của các khối đang chờ.
-    - Kiểm tra tất cả vị trí đặt hợp lệ của từng khối mà KHÔNG cắt nhánh sớm bằng heuristic.
-    - Tối ưu hóa bước lá (khối cuối cùng) bằng bảng nhớ Exact Leaf Memoization theo
-      (last_piece_slot, board_mask, combo_streak) giúp duyệt 100% tổ hợp cực nhanh và chính xác tuyệt đối.
-    """
     t_start = time.perf_counter()
     if not pieces:
         if return_details:
@@ -1001,8 +831,6 @@ def solve_best_sequence(board_mask, pieces, return_details=False):
     best_solution = None
     top_candidates_map = {}
     nodes_evaluated = 0
-
-    # Bảng nhớ chính xác cho khối cuối cùng: (slot_id, cur_mask, combo_streak) -> best_leaf_result
     leaf_cache = {}
 
     def evaluate_last_piece_exact(p_last, cur_mask, combo_streak):
@@ -1021,7 +849,6 @@ def solve_best_sequence(board_mask, pieces, return_details=False):
                     cur_mask, pmask, cells, combo_streak
                 )
                 h_val = evaluate_positional_heuristic(nb)
-                # Khóa so sánh cục bộ hoàn toàn đồng bộ với khóa toàn cục
                 metric = (
                     int(step_score),
                     int(lines),
@@ -1059,17 +886,12 @@ def solve_best_sequence(board_mask, pieces, return_details=False):
             best_key = rk
             best_solution = sol_obj
 
-        # Lưu lại các phương án dự phòng tốt nhất (khác nhau về chuỗi vị trí đặt)
         sig = tuple((s["slot"], s["row"], s["col"]) for s in steps)
         prev = top_candidates_map.get(sig)
         if prev is None or rk > prev["rank_key"]:
             top_candidates_map[sig] = sol_obj
 
-    # Duyệt toàn bộ các hoán vị theo thứ tự cố định
     all_perms = list(itertools.permutations(pieces))
-
-    # Bảng nhớ tránh duyệt lại trạng thái trung gian trùng lặp hoàn toàn:
-    # (remaining_slots_tuple, cur_mask, combo_streak, acc_score, acc_lines, max_simul)
     visited_states = set()
 
     for perm in all_perms:
@@ -1089,11 +911,10 @@ def solve_best_sequence(board_mask, pieces, return_details=False):
 
             p = perm[idx]
 
-            # Nếu đang ở khối cuối cùng của hoán vị và đã đặt ít nhất các khối trước đó:
             if idx == n_p - 1:
                 leaf_res = evaluate_last_piece_exact(p, cur_mask, combo_streak)
                 if leaf_res is not None:
-                    r0, c0, nb, lines, r_clr, c_clr, step_score, next_combo, _ = leaf_res
+                    r0, c0, nb, lines, r_clr, c_clr, step_score, _, _ = leaf_res
                     steps.append({
                         "slot": p["slot"],
                         "name": p["name"],
@@ -1114,11 +935,9 @@ def solve_best_sequence(board_mask, pieces, return_details=False):
                     )
                     steps.pop()
                 else:
-                    # Khối cuối không đặt được -> ghi nhận phương án đặt một phần
                     register_solution(steps, cur_mask, acc_score, acc_lines, max_simul)
                 return
 
-            # Duyệt VÉT CẠN 100% mọi vị trí hợp lệ của khối hiện tại (không cắt nhánh!)
             any_placed = False
             for r0, c0, pmask, cells in p["placements"]:
                 if (cur_mask & pmask) == 0:
@@ -1150,7 +969,6 @@ def solve_best_sequence(board_mask, pieces, return_details=False):
                     steps.pop()
 
             if not any_placed:
-                # Nếu khối hiện tại bị kẹt, ghi nhận các bước đã đặt được và thử đặt các khối kế tiếp
                 register_solution(steps, cur_mask, acc_score, acc_lines, max_simul)
                 dfs_exhaustive(idx + 1, cur_mask, steps, combo_streak, acc_score, acc_lines, max_simul)
 
@@ -1178,7 +996,6 @@ def solve_best_sequence(board_mask, pieces, return_details=False):
 
 
 def build_solution_explanation(best_sol, total_pieces, nodes_evaluated, elapsed_ms):
-    """Tạo lời giải thích ngắn gọn, rõ ràng vì sao phương án này được chọn."""
     if not best_sol or not best_sol["steps"]:
         return (
             f"Đã kiểm tra vét cạn 100% ({nodes_evaluated} trạng thái trong {elapsed_ms}ms) "
@@ -1192,17 +1009,15 @@ def build_solution_explanation(best_sol, total_pieces, nodes_evaluated, elapsed_
     h_score = best_sol["heuristic_score"]
     order_str = " ➔ ".join(f"{s['name']} (H{s['row']},C{s['col']})" for s in steps)
 
-    reasons = [
-        f"Đặt được {placed_cnt}/{total_pieces} khối theo thứ tự: {order_str}.",
-        f"Đạt tổng điểm GAME SCORE cao nhất là +{g_score} điểm (xóa tổng cộng {t_lines} hàng/cột).",
-        f"Điểm thế cờ sau lượt đi đạt {h_score} (tối ưu không gian trống và hạn chế lỗ cô lập 1x1).",
-        f"Đã duyệt vét cạn {nodes_evaluated} trạng thái trong {elapsed_ms}ms.",
-    ]
-    return " ".join(reasons)
+    return (
+        f"Đặt được {placed_cnt}/{total_pieces} khối theo thứ tự: {order_str}. "
+        f"Đạt tổng điểm GAME SCORE cao nhất là +{g_score} điểm (xóa {t_lines} hàng/cột). "
+        f"Điểm thế cờ: {h_score}. Đã duyệt vét cạn {nodes_evaluated} trạng thái trong {elapsed_ms}ms."
+    )
 
 
 # ==============================================================================
-# 3. ĐỊNH DẠNG BÁO CÁO KIỂM CHỨNG, THÔNG BÁO iOS & VẼ ẢNH KẾT QUẢ
+# 3. ĐỊNH DẠNG BÁO CÁO, THÔNG BÁO iOS & VẼ ẢNH KẾT QUẢ
 # ==============================================================================
 def format_matrix_str(mat):
     if not mat:
@@ -1211,10 +1026,6 @@ def format_matrix_str(mat):
 
 
 def format_verification_report_text(board, pieces, meta):
-    """
-    Tạo báo cáo kiểm tra dữ liệu nhận diện (Bàn cờ 8x8 + 3 khối + Độ tin cậy)
-    đúng định dạng trực quan để người dùng đối chiếu trước khi giải.
-    """
     lines = []
     lines.append("🔍 KẾT QUẢ NHẬN DIỆN DỮ LIỆU ĐẦU VÀO")
     lines.append(f"• Mã ảnh (SHA256): {meta['image_hash']}")
@@ -1254,12 +1065,6 @@ def format_verification_report_text(board, pieces, meta):
 
 
 def format_ios_alert_text(board, steps, details=None, meta=None):
-    """
-    Định dạng thông báo cho iOS Shortcut:
-    - Hiển thị cảnh báo nếu độ tin cậy nhận diện thấp.
-    - 3 dòng đầu là hướng dẫn thứ tự đặt khối, vị trí (Hàng, Cột) và số hàng/cột xóa.
-    - Hiển thị Tổng SCORE dự kiến và bản đồ trực quan 8x8.
-    """
     warning_header = ""
     if meta and (meta.get("uncertain_slots") or len(meta.get("uncertain_cells", [])) > 3):
         warning_header = "⚠️ LƯU Ý: Có vùng ảnh độ tương phản thấp, hãy kiểm tra kỹ!\n"
@@ -1306,17 +1111,10 @@ def format_ios_alert_text(board, steps, details=None, meta=None):
 
 
 def render_inspection_image(board, pieces, meta):
-    """
-    Vẽ ảnh kiểm chứng nhận diện (Inspection Image):
-    - Đánh số Hàng 1..8 và Cột 1..8 quanh bàn cờ.
-    - Đánh dấu tâm các ô được nhận diện là đã có block (1) và các ô nghi ngờ (nếu có).
-    - Đánh dấu khung bounding box và lưới chia ô (rows x cols) ngay trên 3 khối ở khu vực chờ.
-    """
     img = meta["scaled_img"].copy()
     draw = ImageDraw.Draw(img, "RGBA")
     bx, by, bw, cw = meta["bx"], meta["by"], meta["bw"], meta["cw"]
 
-    # Vẽ khung bàn cờ và số thứ tự Hàng / Cột
     draw.rectangle([bx - 2, by - 2, bx + bw + 2, by + bw + 2], outline=(0, 255, 180, 255), width=3)
     for c in range(8):
         cx = int(round(bx + (c + 0.35) * cw))
@@ -1325,7 +1123,6 @@ def render_inspection_image(board, pieces, meta):
         ry = int(round(by + (r + 0.35) * cw))
         draw.text((max(2, bx - 26), ry), f"H{r+1}", fill=(255, 255, 255, 255))
 
-    # Vẽ trạng thái 64 ô bàn cờ
     for r in range(8):
         for c in range(8):
             x0 = int(round(bx + c * cw))
@@ -1344,7 +1141,6 @@ def render_inspection_image(board, pieces, meta):
             else:
                 draw.text((x0 + 12, y0 + 10), "0", fill=(160, 174, 192, 180))
 
-    # Vẽ khung kiểm chứng 3 khối ở khu vực chờ
     for sd in meta.get("slot_details", []):
         sx0, sy0, sx1, sy1 = sd["slot_box"]
         draw.rectangle([sx0, sy0, sx1, sy1], outline=(148, 163, 184, 140), width=2)
@@ -1384,17 +1180,10 @@ def render_inspection_image(board, pieces, meta):
 
 
 def render_solution_image(meta, steps, details=None, board=None):
-    """
-    Xuất ảnh PNG hướng dẫn vị trí đặt từng khối trực quan:
-    - Đánh số Hàng 1..8, Cột 1..8 trên viền bàn cờ.
-    - Tô màu phân biệt Bước #1 (Xanh lam), Bước #2 (Vàng), Bước #3 (Tím).
-    - Ghi chú hướng dẫn đặt 3 bước và tổng điểm SCORE ngay trên ảnh.
-    """
     img = meta["scaled_img"].copy()
     draw = ImageDraw.Draw(img, "RGBA")
     bx, by, bw, cw = meta["bx"], meta["by"], meta["bw"], meta["cw"]
 
-    # Vẽ chỉ số Hàng 1..8 và Cột 1..8
     for c in range(8):
         cx = int(round(bx + (c + 0.38) * cw))
         draw.text((cx, max(4, by - 20)), f"C{c+1}", fill=(255, 255, 255, 255))
@@ -1403,9 +1192,9 @@ def render_solution_image(meta, steps, details=None, board=None):
         draw.text((max(2, bx - 24), ry), f"H{r+1}", fill=(255, 255, 255, 255))
 
     colors = [
-        (56, 189, 248, 195),   # Bước 1: Xanh Cyan
-        (250, 204, 21, 195),   # Bước 2: Vàng Gold
-        (192, 132, 252, 195),  # Bước 3: Tím Purple
+        (56, 189, 248, 195),
+        (250, 204, 21, 195),
+        (192, 132, 252, 195),
     ]
 
     for i, st in enumerate(steps):
@@ -1422,7 +1211,6 @@ def render_solution_image(meta, steps, details=None, board=None):
                     draw.rectangle([x0, y0, x1, y1], fill=color, outline=(255, 255, 255, 255), width=3)
                     draw.text((x0 + 6, y0 + 5), f"#{i+1}", fill=(10, 15, 30, 255))
 
-    # Vẽ bảng tóm tắt thứ tự bước đi và tổng SCORE ở phía trên bàn cờ
     banner_y0 = max(6, by - 135)
     banner_y1 = max(banner_y0 + 88, by - 26)
     draw.rectangle([bx, banner_y0, bx + bw, banner_y1], fill=(15, 23, 42, 230), outline=(56, 189, 248, 255), width=2)
@@ -1451,7 +1239,6 @@ def render_solution_image(meta, steps, details=None, board=None):
 # 4. LƯU LOG LỊCH SỬ & TRÍCH XUẤT ẢNH TỪ REQUEST
 # ==============================================================================
 def save_audit_log(meta, board, pieces, details):
-    """Lưu lại dữ liệu nhận diện và kết quả giải vào file JSONL để đối chiếu giữa các lần chạy."""
     try:
         record = {
             "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
@@ -1482,7 +1269,7 @@ def extract_image_from_request(req):
 
 
 # ==============================================================================
-# 5. CÁC ENDPOINT FLASK SERVER (/solve, /inspect, /solve_manual, /ui)
+# 5. CÁC ENDPOINT FLASK SERVER (/img, /solve, /inspect, /solve_manual, /ui)
 # ==============================================================================
 @app.route("/", methods=["GET"])
 def health_check():
@@ -1491,16 +1278,25 @@ def health_check():
     return "OK", 200
 
 
+@app.route("/img", methods=["POST"])
+def solve_image_shortcut_endpoint():
+    """Đường dẫn tắt siêu gọn cho iOS Shortcut: Gửi ảnh lên là trả về ngay ảnh PNG giải sẵn."""
+    try:
+        pil_img = extract_image_from_request(request)
+        if pil_img is None:
+            return "⚠️ Không nhận được ảnh!", 400
+        board, board_mask, pieces, meta = detect_board_and_pieces(pil_img)
+        details = solve_best_sequence(board_mask, pieces, return_details=True)
+        steps = details["best_steps"]
+        save_audit_log(meta, board, pieces, details)
+        buf = render_solution_image(meta, steps, details=details, board=board)
+        return send_file(buf, mimetype="image/png")
+    except Exception as e:
+        return f"❌ Lỗi: {str(e)}", 500
+
+
 @app.route("/solve", methods=["POST"])
 def solve_endpoint():
-    """
-    Endpoint chính tương thích 100% với Shortcut cũ và mới:
-    - Mặc định trả về văn bản hướng dẫn gọn cho iOS.
-    - ?format=image : Trả về ảnh PNG đánh dấu vị trí đặt khối (#1, #2, #3) và điểm SCORE.
-    - ?format=verify_text : Chỉ trả về báo cáo ma trận nhận diện 8x8 và 3 khối để kiểm tra.
-    - ?format=inspect_image : Trả về ảnh PNG đóng khung lưới nhận diện 8x8 và 3 khối.
-    - ?format=json : Trả về toàn bộ dữ liệu JSON (ma trận, độ tin cậy, phương án tốt nhất, dự phòng, ảnh Base64).
-    """
     try:
         pil_img = extract_image_from_request(request)
         if pil_img is None:
@@ -1509,7 +1305,6 @@ def solve_endpoint():
         board, board_mask, pieces, meta = detect_board_and_pieces(pil_img)
         fmt = request.args.get("format", "text").lower()
 
-        # Lưu session gần nhất để người dùng có thể mở /ui kiểm tra hoặc sửa tay ngay
         session_id = str(uuid.uuid4())[:8]
         SESSIONS_CACHE["latest"] = {
             "session_id": session_id,
@@ -1573,10 +1368,6 @@ def solve_endpoint():
 
 @app.route("/inspect", methods=["POST"])
 def inspect_endpoint():
-    """
-    Endpoint chuyên dụng cho Bước 1 của Chế độ 2 (Giải chính xác):
-    Quét ảnh, trả về báo cáo kiểm chứng ma trận bàn cờ + 3 khối + độ tin cậy.
-    """
     try:
         pil_img = extract_image_from_request(request)
         if pil_img is None:
@@ -1598,18 +1389,6 @@ def inspect_endpoint():
 
 @app.route("/solve_manual", methods=["POST"])
 def solve_manual_endpoint():
-    """
-    Endpoint giải từ dữ liệu ma trận đã được người dùng kiểm tra hoặc chỉnh sửa thủ công.
-    Nhận JSON:
-    {
-      "board": [[0,1,...], ...],  (8x8)
-      "pieces": [
-        {"slot": 1, "name": "TRÁI", "matrix": [[1,1,1,1]]},
-        {"slot": 2, "name": "GIỮA", "matrix": [[1,0],[1,0],[1,1]]},
-        {"slot": 3, "name": "PHẢI", "matrix": [[1,1],[1,1]]}
-      ]
-    }
-    """
     try:
         data = request.get_json(force=True)
         board = data.get("board")
@@ -1675,10 +1454,6 @@ def solve_manual_endpoint():
 
 @app.route("/ui", methods=["GET"])
 def render_web_inspector_ui():
-    """
-    Giao diện Web trực quan để tải ảnh chụp màn hình lên, đối chiếu kết quả nhận diện,
-    chỉnh sửa thủ công từng ô trên bàn cờ 8x8 hoặc 3 khối chờ xếp, và chạy bộ giải SCORE cao nhất.
-    """
     html = """<!DOCTYPE html>
 <html lang="vi">
 <head>
@@ -1707,7 +1482,7 @@ def render_web_inspector_ui():
 <body>
   <div style="max-width:1080px;margin:0 auto 16px auto;">
     <h1>🧩 Block Blast Solver – Kiểm Chứng Nhận Diện & Tối Ưu SCORE</h1>
-    <p style="color:#94a3b8;margin:4px 0;">Tải ảnh chụp màn hình lên để kiểm tra bàn cờ 8×8 và 3 khối hình. Nếu muốn chỉnh sửa, hãy chạm trực tiếp vào các ô bên dưới rồi bấm <b>Giải Lại Từ Ma Trận Đã Chỉnh Sửa</b>.</p>
+    <p style="color:#94a3b8;margin:4px 0;">Tải ảnh chụp màn hình lên để kiểm tra bàn cờ 8×8 và 3 khối hình. Nếu muốn chỉnh sửa, hãy chạm trực tiếp vào các ô bên dưới rồi bấm <b>Giải Lại Từ Ma Trận Đang Chỉnh Sửa</b>.</p>
     <input type="file" id="fileInput" accept="image/*" style="margin-top:8px;">
     <button class="btn" onclick="uploadAndInspect()">1. Quét Ảnh & Giải Ngay</button>
     <button class="btn btn-success" onclick="solveFromManualGrid()">2. Giải Lại Từ Ma Trận Đang Chỉnh Sửa</button>
@@ -1830,281 +1605,6 @@ renderGrids();
     return Response(html, mimetype="text/html; charset=utf-8")
 
 
-# ==============================================================================
-# 6. BỘ KIỂM THỬ NGHIÊM TÚC & ĐỐI CHIẾU VỚI BRUTE-FORCE ĐỘC LẬP (--test)
-# ==============================================================================
-def _create_synthetic_screenshot(
-    board_mat,
-    dock_mats,
-    width=720,
-    height=1560,
-    add_shadow=True,
-    piece_scales=None,
-    bg_color=(28, 36, 72),
-):
-    """
-    Tạo ảnh chụp màn hình mô phỏng thực tế với nhiều độ phân giải, tỷ lệ màn hình,
-    hiệu ứng gờ nổi 3D (bevel), bóng đổ (drop shadow) và tỷ lệ co giãn khối khác nhau.
-    """
-    img = Image.new("RGB", (width, height), bg_color)
-    draw = ImageDraw.Draw(img)
-
-    bw = int(round(width * 0.908))
-    bx = (width - bw) // 2
-    by = int(round(height * 0.228))
-    cw = bw / 8.0
-
-    draw.rectangle([bx - 4, by - 4, bx + bw + 4, by + bw + 4], fill=(18, 24, 52), outline=(65, 85, 140), width=3)
-
-    def draw_3d_tile(x0, y0, x1, y1, base_color):
-        r, g, b = base_color
-        top_c = (min(255, r + 48), min(255, g + 48), min(255, b + 48))
-        bot_c = (max(0, r - 48), max(0, g - 48), max(0, b - 48))
-        draw.rectangle([x0, y0, x1, y1], fill=base_color, outline=(14, 18, 38), width=2)
-        b_w = max(2, int(round((x1 - x0) * 0.16)))
-        draw.rectangle([x0 + 2, y0 + 2, x1 - 2, y0 + b_w], fill=top_c)
-        draw.rectangle([x0 + 2, y1 - b_w, x1 - 2, y1 - 2], fill=bot_c)
-
-    for r in range(8):
-        for c in range(8):
-            x0 = int(round(bx + c * cw))
-            y0 = int(round(by + r * cw))
-            x1 = int(round(bx + (c + 1) * cw))
-            y1 = int(round(by + (r + 1) * cw))
-            if board_mat[r][c] == 0:
-                draw.rectangle([x0 + 2, y0 + 2, x1 - 2, y1 - 2], fill=(22, 29, 58), outline=(34, 44, 82))
-            else:
-                draw_3d_tile(x0 + 1, y0 + 1, x1 - 1, y1 - 1, (235, 88, 52))
-
-    dock_y0 = int(round(by + bw + height * 0.042))
-    dock_h = int(round(height * 0.195))
-    dock_x0 = int(round(width * 0.04))
-    slot_w = int(round((width * 0.92) / 3.0))
-    unit_base = cw * 0.472
-    piece_colors = [(52, 211, 153), (251, 191, 36), (168, 85, 247)]
-
-    for s, mat in enumerate(dock_mats):
-        if mat is None:
-            continue
-        rows, cols = len(mat), len(mat[0])
-        if piece_scales and s < len(piece_scales) and piece_scales[s] is not None:
-            u = unit_base * piece_scales[s]
-        else:
-            u = unit_base * 0.86 if max(rows, cols) == 5 else unit_base
-        pw = cols * u
-        ph = rows * u
-        sx_center = dock_x0 + s * slot_w + slot_w / 2.0
-        sy_center = dock_y0 + dock_h * 0.45
-        px0 = sx_center - pw / 2.0
-        py0 = sy_center - ph / 2.0
-
-        if add_shadow:
-            for r in range(rows):
-                for c in range(cols):
-                    if mat[r][c] == 1:
-                        tx0 = int(round(px0 + c * u))
-                        ty0 = int(round(py0 + r * u))
-                        tx1 = int(round(px0 + (c + 1) * u))
-                        ty1 = int(round(py0 + (r + 1) * u))
-                        draw.rectangle([tx0 + 3, ty0 + 5, tx1 + 3, ty1 + 7], fill=(12, 16, 35))
-
-        for r in range(rows):
-            for c in range(cols):
-                if mat[r][c] == 1:
-                    tx0 = int(round(px0 + c * u))
-                    ty0 = int(round(py0 + r * u))
-                    tx1 = int(round(px0 + (c + 1) * u))
-                    ty1 = int(round(py0 + (r + 1) * u))
-                    draw_3d_tile(tx0, ty0, tx1, ty1, piece_colors[s % 3])
-
-    return img
-
-
-def brute_force_reference_solver(board_mask, pieces):
-    """
-    Bộ giải vét cạn thuần túy (Reference Brute-Force không dùng bất kỳ bảng nhớ/cache nào)
-    để làm chuẩn đối chiếu toán học cho thuật toán chính.
-    """
-    best_key = None
-    best_steps = []
-    best_score = 0
-
-    for perm in itertools.permutations(pieces):
-        def rec(idx, cur_mask, steps, combo, acc_score, acc_lines, max_sim):
-            nonlocal best_key, best_steps, best_score
-            if idx == len(perm):
-                if steps:
-                    h = evaluate_positional_heuristic(cur_mask)
-                    rk = build_solution_ranking_key(steps, acc_score, acc_lines, max_sim, h)
-                    if best_key is None or rk > best_key:
-                        best_key = rk
-                        best_steps = [dict(s) for s in steps]
-                        best_score = acc_score
-                return
-
-            p = perm[idx]
-            placed = False
-            for r0, c0, pmask, cells in p["placements"]:
-                if (cur_mask & pmask) == 0:
-                    placed = True
-                    nb, lines, r_c, c_c, st_sc, nxt_c = simulate_bitboard(cur_mask, pmask, cells, combo)
-                    steps.append({
-                        "slot": p["slot"],
-                        "name": p["name"],
-                        "matrix": p["matrix"],
-                        "row": r0 + 1,
-                        "col": c0 + 1,
-                        "lines": lines,
-                        "step_score": st_sc,
-                    })
-                    rec(idx + 1, nb, steps, nxt_c, acc_score + st_sc, acc_lines + lines, max(max_sim, lines))
-                    steps.pop()
-
-            if not placed:
-                if steps:
-                    h = evaluate_positional_heuristic(cur_mask)
-                    rk = build_solution_ranking_key(steps, acc_score, acc_lines, max_sim, h)
-                    if best_key is None or rk > best_key:
-                        best_key = rk
-                        best_steps = [dict(s) for s in steps]
-                        best_score = acc_score
-                rec(idx + 1, cur_mask, steps, combo, acc_score, acc_lines, max_sim)
-
-        rec(0, board_mask, [], 0, 0, 0, 0)
-
-    return best_steps, best_score, best_key
-
-
-def run_self_tests():
-    print("==================================================================")
-    print("BẮT ĐẦU CHẠY BỘ KIỂM THỬ NGHIÊM NGẶT BLOCK BLAST SOLVER (8 TESTS)")
-    print("==================================================================")
-    empty_board = [[0] * 8 for _ in range(8)]
-
-    # TEST 1: Phân biệt thanh 1x4, 1x5, 4x1, 5x1 ở các tỷ lệ co giãn và độ phân giải khác nhau
-    bar_1x4 = [[1, 1, 1, 1]]
-    bar_1x5 = [[1, 1, 1, 1, 1]]
-    bar_4x1 = [[1], [1], [1], [1]]
-    bar_5x1 = [[1], [1], [1], [1], [1]]
-
-    for res_w, res_h in [(750, 1334), (1170, 2532), (1080, 2400)]:
-        img1 = _create_synthetic_screenshot(
-            empty_board, [bar_1x4, bar_1x5, bar_4x1], width=res_w, height=res_h, piece_scales=[0.92, 0.85, 0.96]
-        )
-        _, _, p1, _ = detect_board_and_pieces(img1)
-        assert [p["matrix"] for p in p1] == [bar_1x4, bar_1x5, bar_4x1], f"Lỗi ở độ phân giải {res_w}x{res_h}"
-
-    img1b = _create_synthetic_screenshot(empty_board, [bar_5x1, bar_1x4, bar_1x5], piece_scales=[0.84, 0.90, 0.86])
-    _, _, p1b, _ = detect_board_and_pieces(img1b)
-    assert [p["matrix"] for p in p1b] == [bar_5x1, bar_1x4, bar_1x5]
-    print("[PASS] Test 1: Phân biệt chính xác tuyệt đối 1x4, 1x5, 4x1, 5x1 trên màn hình 16:9, 19.5:9 và 20:9.")
-
-    # TEST 2: Các khối không đối xứng phức tạp (Chữ L ngược, Chữ T xoay, Chữ Z, góc khuyết 3x3)
-    shape_L_asym = [[1, 0], [1, 0], [1, 1]]
-    shape_T_rot = [[0, 1], [1, 1], [0, 1]]
-    shape_Z = [[1, 1, 0], [0, 1, 1]]
-    img2 = _create_synthetic_screenshot(empty_board, [shape_L_asym, shape_T_rot, shape_Z], add_shadow=True)
-    _, _, p2, meta2 = detect_board_and_pieces(img2)
-    assert [p["matrix"] for p in p2] == [shape_L_asym, shape_T_rot, shape_Z]
-    assert meta2["overall_confidence"] >= 0.80
-    print("[PASS] Test 2: Nhận diện chính xác các khối chữ L, T, Z không đối xứng kèm đánh giá độ tin cậy.")
-
-    # TEST 3: Bàn cờ trống hoàn toàn (0 block) và bàn cờ gần đầy (58/64 block)
-    _, mask_empty, _, _ = detect_board_and_pieces(img2)
-    assert mask_empty == 0, "Bàn cờ trống bị nhận nhầm là có gạch!"
-
-    nearly_full = [[1] * 8 for _ in range(8)]
-    for c in range(2, 6):
-        nearly_full[4][c] = 0
-    nearly_full[0][0] = 0
-    img3 = _create_synthetic_screenshot(nearly_full, [bar_1x4, [[1]], [[1, 1]]])
-    det_b3, _, _, _ = detect_board_and_pieces(img3)
-    assert det_b3 == nearly_full, "Nhận diện sai bàn cờ gần đầy!"
-    print("[PASS] Test 3: Nhận diện chuẩn xác cả bàn cờ trống 0/64 lẫn bàn cờ gần đầy 59/64 ô.")
-
-    # TEST 4: Kiểm chứng tính bất biến (Determinism - Cùng 1 ảnh chạy nhiều lần phải ra đúng 1 kết quả)
-    runs = []
-    for _ in range(5):
-        b_i, bm_i, pcs_i, _ = detect_board_and_pieces(img3)
-        st_i = solve_best_sequence(bm_i, pcs_i)
-        runs.append((b_i, [p["matrix"] for p in pcs_i], [(s["slot"], s["row"], s["col"]) for s in st_i]))
-    for r_idx in range(1, 5):
-        assert runs[r_idx] == runs[0], "Kết quả không đồng nhất giữa các lần chạy!"
-    print("[PASS] Test 4: Đảm bảo tính bất biến 100% (cùng một ảnh luôn cho ra cùng một ma trận và phương án giải).")
-
-    # TEST 5: Tối ưu hóa SCORE - Xóa đồng thời nhiều hàng & cột (Multi-line Clear + Combo Streak)
-    # Thiết lập bàn cờ mà nếu đặt đúng vị trí sẽ xóa đồng thời 2 hàng + 1 cột (3 lines = +60 điểm xóa)
-    combo_board = [[0] * 8 for _ in range(8)]
-    for c in range(8):
-        if c not in (3, 4):
-            combo_board[2][c] = 1
-            combo_board[3][c] = 1
-    for r in range(8):
-        if r not in (2, 3):
-            combo_board[r][3] = 1
-    c_mask = sum((1 << (r * 8 + c)) for r in range(8) for c in range(8) if combo_board[r][c] == 1)
-    p_2x2 = {"slot": 1, "name": "TRÁI", "matrix": [[1, 1], [1, 1]], "placements": precompute_placements([[1, 1], [1, 1]])}
-    p_dot = {"slot": 2, "name": "GIỮA", "matrix": [[1]], "placements": precompute_placements([[1]])}
-    res5 = solve_best_sequence(c_mask, [p_dot, p_2x2], return_details=True)
-    # Đặt khối 2x2 vào Hàng 3, Cột 4 (r0=2, c0=3) sẽ xóa đồng thời Hàng 3, Hàng 4 và Cột 4 (tổng 3 lines!)
-    assert any(s["slot"] == 1 and s["row"] == 3 and s["col"] == 4 and s["lines"] == 3 for s in res5["best_steps"])
-    assert res5["best_solution"]["game_score"] >= 65
-    print(f"[PASS] Test 5: Tìm đúng nước đi xóa đồng thời 2 hàng + 1 cột đạt SCORE cao nhất (+{res5['best_solution']['game_score']} điểm).")
-
-    # TEST 6: Đối chiếu trực tiếp với Brute-Force thuần túy để chứng minh KHÔNG bỏ sót phương án tối ưu
-    test_board = [[1] * 8 for _ in range(8)]
-    # Mở một số ô trống vừa đủ để tạo khoảng 15-20 vị trí đặt cho mỗi khối
-    empty_coords = [
-        (0, 0), (0, 1), (0, 2), (0, 3),
-        (1, 0), (1, 1), (1, 2),
-        (2, 0), (2, 1),
-        (5, 5), (5, 6), (6, 5), (6, 6),
-    ]
-    for r, c in empty_coords:
-        test_board[r][c] = 0
-    t_mask = sum((1 << (r * 8 + c)) for r in range(8) for c in range(8) if test_board[r][c] == 1)
-    test_pieces = [
-        {"slot": 1, "name": "TRÁI", "matrix": [[1, 1]], "placements": precompute_placements([[1, 1]])},
-        {"slot": 2, "name": "GIỮA", "matrix": [[1, 1], [1, 1]], "placements": precompute_placements([[1, 1], [1, 1]])},
-        {"slot": 3, "name": "PHẢI", "matrix": [[1], [1]], "placements": precompute_placements([[1], [1]])},
-    ]
-    fast_details = solve_best_sequence(t_mask, test_pieces, return_details=True)
-    bf_steps, bf_score, bf_key = brute_force_reference_solver(t_mask, test_pieces)
-
-    assert fast_details["best_solution"]["game_score"] == bf_score, "Điểm SCORE khác với Brute-Force!"
-    assert fast_details["best_solution"]["rank_key"] == bf_key, "Phương án khác với Brute-Force!"
-    print(f"[PASS] Test 6: Khớp 100% với Brute-Force chuẩn (SCORE: +{bf_score}, duyệt {fast_details['stats']['nodes_evaluated']} nút trong {fast_details['stats']['elapsed_ms']}ms).")
-
-    # TEST 7: Trường hợp chỉ đặt được 1 hoặc 2 khối và trường hợp hết nước đi
-    tight_board = [[1] * 8 for _ in range(8)]
-    tight_board[0][0] = 0
-    tight_board[7][7] = 0
-    tight_mask = sum((1 << (r * 8 + c)) for r in range(8) for c in range(8) if tight_board[r][c] == 1)
-    p_a = {"slot": 1, "name": "TRÁI", "matrix": [[1]], "placements": precompute_placements([[1]])}
-    p_b = {"slot": 2, "name": "GIỮA", "matrix": [[1, 1, 1]], "placements": precompute_placements([[1, 1, 1]])}
-    p_c = {"slot": 3, "name": "PHẢI", "matrix": [[1]], "placements": precompute_placements([[1]])}
-    partial_steps = solve_best_sequence(tight_mask, [p_a, p_b, p_c])
-    assert len(partial_steps) == 2
-
-    dead_steps = solve_best_sequence(tight_mask, [p_b])
-    assert dead_steps == []
-    print("[PASS] Test 7: Xử lý chính xác trường hợp đặt một phần (2/3 khối) và trường hợp hết nước đi hợp lệ.")
-
-    # TEST 8: Kiểm tra báo cáo cảnh báo khi có ô chờ bị trống/mờ
-    img_missing = _create_synthetic_screenshot(empty_board, [bar_1x4, None, shape_Z])
-    b8, _, p8, meta8 = detect_board_and_pieces(img_missing)
-    assert len(meta8["uncertain_slots"]) == 1 and meta8["uncertain_slots"][0]["slot"] == 2
-    report8 = format_verification_report_text(b8, p8, meta8)
-    assert "CẢNH BÁO VÙNG CHƯA RÕ RÀNG" in report8
-    print("[PASS] Test 8: Tự động phát hiện và cảnh báo chính xác khi một khối ở khu vực chờ bị trống hoặc không rõ ràng.")
-    print("==================================================================")
-    print("HOÀN TẤT: TẤT CẢ 8 BỘ TEST KIỂM CHỨNG ĐỀU VƯỢT QUA 100%!")
-    print("==================================================================")
-
-
 if __name__ == "__main__":
-    if "--test" in sys.argv:
-        run_self_tests()
-    else:
-        port = int(os.environ.get("PORT", 10000))
-        app.run(host="0.0.0.0", port=port)
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host="0.0.0.0", port=port)
